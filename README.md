@@ -17,6 +17,9 @@ scraper/
     scraper.py          # Local CLI tool for one-off scrapes
     playwright_scraper.py  # Playwright-based scraper for JS-rendered sites
     merge_scrapes.py    # Diff/merge tool for comparing two scrape runs
+  clients/
+    scraper-client.ts   # Deno/TypeScript client for calling the API
+                        # Copy this into your Deno app when ready
 ```
 
 ---
@@ -81,6 +84,8 @@ Scrape a directory URL and return structured business records.
 ---
 
 ## Calling from Deno
+
+A reference client lives in `clients/scraper-client.ts`. Copy it into your Deno app and import from there.
 
 ```typescript
 import { callScraper } from "./scraper-client.ts";
