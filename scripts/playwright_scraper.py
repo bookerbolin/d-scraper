@@ -468,10 +468,11 @@ if __name__ == "__main__":
         print("No records found. The site structure may have changed.")
         sys.exit(1)
 
-    # Save output
-    from urllib.parse import urlparse
-    domain = urlparse(url).netloc.replace("www.", "").replace(".", "_")
-    output_file = f"{domain}_playwright.csv"
+    # Save output — filename includes domain + path slug for clarity
+    parsed = urlparse(url)
+    domain = parsed.netloc.replace("www.", "").replace(".", "_")
+    path_slug = parsed.path.strip("/").replace("/", "_") or "listings"
+    output_file = f"{domain}_{path_slug}_playwright.csv"
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
