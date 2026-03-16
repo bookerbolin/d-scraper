@@ -66,14 +66,14 @@ class ScrapeRequest(BaseModel):
 
 class ScrapeRecord(BaseModel):
     name: str
-    street: str
-    city: str
-    state: str
-    zip: str
-    phone: str
-    website: str
-    description: str
-    source_url: str
+    street: str = ""
+    city: str = ""
+    state: str = ""
+    zip: str = ""
+    phone: str = ""
+    website: str = ""
+    description: str = ""
+    source_url: str = ""
 
 
 class ScrapeResponse(BaseModel):
