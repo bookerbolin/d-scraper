@@ -635,7 +635,12 @@ if __name__ == "__main__":
     parsed = urlparse(url)
     domain = parsed.netloc.replace("www.", "").replace(".", "_")
     path_slug = parsed.path.strip("/").replace("/", "_") or "listings"
-    output_file = f"{domain}_{path_slug}_playwright.csv"
+    # Save to ../data/ folder relative to this script's location
+    import os as _os
+    script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    data_dir = _os.path.join(script_dir, "..", "data")
+    _os.makedirs(data_dir, exist_ok=True)
+    output_file = _os.path.join(data_dir, f"{domain}_{path_slug}_playwright.csv")
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
