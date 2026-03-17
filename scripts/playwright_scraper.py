@@ -25,6 +25,33 @@ from playwright.sync_api import sync_playwright
 
 OUTPUT_FIELDS = ["name", "street", "city", "state", "zip", "phone", "website", "description", "source_url"]
 
+# Full state name → 2-letter abbreviation (US + territories)
+STATE_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+    "puerto rico": "PR", "guam": "GU", "virgin islands": "VI",
+}
+
+def normalize_state(raw):
+    """Convert full state name or 2-letter abbreviation to uppercase abbreviation."""
+    if not raw:
+        return ""
+    stripped = raw.strip()
+    if re.match(r'^[A-Z]{2}$', stripped):
+        return stripped
+    return STATE_ABBR.get(stripped.lower(), stripped.upper() if len(stripped) == 2 else stripped)
+
 
 # ── Address helpers ───────────────────────────────────────────────────────────
 
@@ -81,72 +108,108 @@ def extract_phone(text):
     return ""
 
 
-def resolve_exploregeorgia_detail(detail_url, source_domain="exploregeorgia.org"):
-    """Fetch an exploregeorgia.org detail page and extract address/phone/website."""
+def resolve_detail_page(detail_url, source_domain=None):
+    """
+    Generic detail page resolver. Fetches a listing detail page and extracts:
+    - website (via "Visit Website" / "Official Website" link)
+    - phone (via tel: link)
+    - address (via Location/Address heading → siblings, or address regex)
+    Works for exploregeorgia.org, homeofgolf.com, and similar CMS detail pages.
+    """
     import requests as _req
     from bs4 import BeautifulSoup as _BS
-    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
+    HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    if source_domain is None:
+        source_domain = urlparse(detail_url).netloc
+
     try:
         r = _req.get(detail_url, headers=HEADERS, timeout=12)
         r.raise_for_status()
         soup = _BS(r.text, "lxml")
+        for tag in soup(["nav", "header", "footer"]):
+            tag.decompose()
 
         result = {}
 
-        # Website — "Visit Website" link
+        # Website — "Visit Website" / "Official Website" / "Website" link to external domain
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
-            text = a.get_text(strip=True)
-            if ("Visit Website" in text and href.startswith("http")
-                    and source_domain not in href):
+            text = a.get_text(strip=True).lower()
+            if (href.startswith("http")
+                    and source_domain not in href
+                    and not any(s in href for s in ["facebook", "instagram", "twitter", "yelp", "tripadvisor"])
+                    and any(w in text for w in ["website", "official", "visit site", "homepage"])):
                 result["website"] = href
                 break
 
         # Phone — tel: link
         tel = soup.find("a", href=re.compile(r"^tel:"))
         if tel:
-            digits = re.sub(r"\D", "", tel["href"].replace("tel:", ""))
-            if len(digits) == 10:
-                result["phone"] = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+            phone = extract_phone(tel["href"])
+            if phone:
+                result["phone"] = phone
 
-        # Location block
-        location_heading = soup.find(["h2", "h3"], string=re.compile(r"Location", re.I))
-        if location_heading:
+        # Address — try Location/Address heading → sibling lines first
+        addr_heading = soup.find(
+            ["h2", "h3", "h4", "strong", "dt"],
+            string=re.compile(r"^(location|address)$", re.I)
+        )
+        if addr_heading:
             lines = []
-            for sib in location_heading.find_next_siblings():
-                if sib.name in ("h2", "h3"):
+            for sib in addr_heading.find_next_siblings():
+                if getattr(sib, "name", None) in ("h2", "h3", "h4"):
                     break
                 text = sib.get_text(strip=True)
                 if text:
                     lines.append(text)
 
-            street_lines = []
-            city = state = zip_code = ""
+            street_lines, city, state, zip_code = [], "", "", ""
             for line in lines:
-                if re.match(r"^[A-Z]{2}$", line):
-                    state = line
+                if re.match(r"^[A-Z]{2}$", line) or line.strip().lower() in STATE_ABBR:
+                    state = normalize_state(line)
                 elif re.match(r"^\d{5}$", line):
                     zip_code = line
+                elif re.search(r"\d{5}", line):
+                    # "City, ST 12345" or "City, North Carolina 12345" on one line
+                    m = re.search(r"^(.*?),?\s*([A-Z]{2}|[A-Za-z][a-z]+(?: [A-Za-z][a-z]+)?)\s+(\d{5})", line)
+                    if m:
+                        if not city:
+                            city = m.group(1).strip()
+                        state = normalize_state(m.group(2).strip())
+                        zip_code = m.group(3)
+                    else:
+                        street_lines.append(line)
                 elif not state and not zip_code:
                     street_lines.append(line)
 
             if len(street_lines) > 1:
-                city = street_lines[-1]
-                result["street"] = ", ".join(street_lines[:-1])
+                if not city:
+                    city = street_lines[-1]
+                result["street"] = ", ".join(street_lines[:-1] if not city else street_lines)
             elif street_lines:
-                city = street_lines[0]
-                result["street"] = ""
+                if not city:
+                    city = street_lines[0]
+                else:
+                    result["street"] = street_lines[0]
 
-            if city:
-                result["city"] = city
-            if state:
-                result["state"] = state
-            if zip_code:
-                result["zip"] = zip_code
+            if city:   result["city"]  = city
+            if state:  result["state"] = state
+            if zip_code: result["zip"] = zip_code
+
+        # Fallback: regex scan full page text for address
+        if not result.get("street"):
+            page_text = soup.get_text(" ", strip=True)
+            addr = extract_address_from_text(page_text)
+            if addr:
+                result["street"] = addr
 
         return result
-    except Exception as e:
+    except Exception:
         return {}
+
+
+# Keep old name as alias for backward compat
+resolve_exploregeorgia_detail = resolve_detail_page
 
 
 
@@ -162,7 +225,6 @@ def scrape_drupal_views(start_url):
 
     parsed = urlparse(start_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    city = parsed.netloc.replace("www.", "").replace("visit", "").replace(".org", "").replace(".com", "").title()
 
     first_ajax_url = None
     all_records = []
@@ -219,8 +281,9 @@ def scrape_drupal_views(start_url):
 
     print(f"  view_name: {flat_params.get('view_name', '?')} | display: {flat_params.get('view_display_id', '?')}")
 
+    _HEADERS_BASE = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
     HEADERS_AJAX = {
-        **HEADERS,
+        **_HEADERS_BASE,
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json",
         "Referer": start_url,
@@ -289,8 +352,8 @@ def scrape_drupal_views(start_url):
             phone = extract_phone(text)
 
             all_records.append({
-                "name": name, "street": street, "city": city,
-                "state": "GA", "zip": "", "phone": phone,
+                "name": name, "street": street, "city": "",
+                "state": "", "zip": "", "phone": phone,
                 "website": detail_url, "description": "",
                 "source_url": start_url,
             })
@@ -312,7 +375,6 @@ def scrape_simpleview(start_url):
     """
     parsed = urlparse(start_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    city = parsed.netloc.replace("www.", "").replace("visit", "").replace(".org", "").replace(".com", "").title()
 
     all_records = []
     api_responses = []
@@ -383,8 +445,8 @@ def scrape_simpleview(start_url):
                     all_records.append({
                         "name":        item.get("title", item.get("name", "")),
                         "street":      addr,
-                        "city":        item.get("city", city),
-                        "state":       item.get("state", "NC"),
+                        "city":        item.get("city", ""),
+                        "state":       item.get("state", ""),
                         "zip":         item.get("zip", item.get("postal_code", "")),
                         "website":     item.get("weburl", item.get("url", item.get("website", ""))),
                         "description": item.get("description", item.get("teaser", "")),
@@ -539,7 +601,6 @@ def scrape_all_pages(start_url):
     """
     parsed = urlparse(start_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    city = parsed.netloc.replace("www.", "").replace("visit", "").replace(".org", "").replace(".com", "").title()
 
     all_items = []
     seen_ids = set()
@@ -601,104 +662,151 @@ def scrape_all_pages(start_url):
         page = context.new_page()
 
         candidate_urls = []  # track all find URLs with item counts
+        captured_urls = set()  # avoid duplicates
+        import json as _json
 
+        # Use response event handler — simpler than route interception
+        # We read URL only (not body) to avoid race conditions with browser close
         def handle_response(response):
-            nonlocal first_api_url
-            if "plugins_listings_listings/find" in response.url and response.status == 200:
-                try:
-                    data = response.json()
-                    items = parse_items(data)
-                    new_count = 0
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        uid = item.get("recid", item.get("id", item.get("title", "")))
-                        if uid not in seen_ids:
-                            seen_ids.add(uid)
-                            all_items.append(item)
-                            new_count += 1
-                    print(f"  Page 1: +{new_count} items from API")
-                    if new_count > 0:
-                        candidate_urls.append((new_count, response.url))
-                except Exception as e:
-                    print(f"  Error: {e}")
+            url = response.url
+            if ("plugins_listings_listings/find" in url
+                    and response.status == 200
+                    and url not in captured_urls):
+                captured_urls.add(url)
+                # Decode and check if this looks like a real directory call
+                import urllib.parse as _upd
+                decoded = _upd.unquote(url)
+                has_skip = '"skip"' in decoded
+                has_count_true = '"count":true' in decoded
+                has_filter_tags = 'filter_tags' in decoded
+                if has_filter_tags:
+                    # Score: count=true is best, skip is next
+                    score = (2 if has_count_true else 0) + (1 if has_skip else 0)
+                    candidate_urls.append((score, url))
 
         page.on("response", handle_response)
+
         print(f"Loading page 1: {start_url}")
         page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)  # allow JS to render after DOM load
-        time.sleep(2)
+
+        # Wait for listing cards — signals all API calls have fired
+        try:
+            page.wait_for_selector(
+                "[class*='listing'], [class*='result'], article, .sv-listing",
+                timeout=10000
+            )
+            print("  Listings detected in DOM — all API calls should be complete")
+        except Exception:
+            print("  No listing selector matched — waiting 8s for API calls...")
+        # Scroll down to trigger lazy-loaded directory grid API calls
+        for _ in range(6):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            time.sleep(1.5)
+
+        # Wait for the count=true URL to appear (it fires when the grid renders)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if any('"count":true' in __import__('urllib.parse', fromlist=['unquote']).unquote(u)
+                   for _, u in candidate_urls):
+                print("  count=true URL captured — ready to paginate")
+                break
+            time.sleep(0.5)
 
         # Pick the best template URL — prefer one containing "skip", fallback to most items
         import urllib.parse as _up3
         if candidate_urls:
-            # Sort by item count descending, prefer URLs containing skip
-            skip_urls = [(c, u) for c, u in candidate_urls if "skip" in _up3.unquote(u).lower()]
-            best_count, best_url = (skip_urls[0] if skip_urls else sorted(candidate_urls, reverse=True)[0])
-            first_api_url = best_url
-            print(f"  Using template URL ({best_count} items, contains skip: {bool(skip_urls)})")
-            decoded = _up3.unquote(first_api_url)
-            print(f"  Full decoded URL:")
-            for _i in range(0, min(len(decoded), 800), 200):
-                print(f"    {decoded[_i:_i+200]}")
+            # Pick highest-scored URL (score: count=true=2, skip=1)
+            best_score, first_api_url = sorted(candidate_urls, reverse=True)[0]
+            print(f"  Using template URL (score={best_score})")
 
-        # Now replay the captured API URL with increasing skip values
+        # Fetch page 1 and all subsequent pages via requests (browser already closed)
         if first_api_url:
-            import math, re as _re
+            import math, re as _re, requests as _req
             import urllib.parse as _up4
 
-            # Detect actual limit from the URL so page count is correct
+            api_headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Referer": start_url,
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+
+            def build_paginated_url(template_url, skip, limit):
+                """
+                Robustly build a paginated URL by decode → parse JSON → modify → re-encode.
+                Falls back to regex substitution if JSON parsing fails.
+                """
+                from urllib.parse import urlparse as _ulp, parse_qs as _pqs, urlencode as _ue, unquote as _uq, quote as _uqq
+                parsed_u = _ulp(template_url)
+                params = _pqs(parsed_u.query, keep_blank_values=True)
+                modified = False
+                for param_key, values in params.items():
+                    for i, val in enumerate(values):
+                        decoded_val = _uq(val)
+                        try:
+                            obj = _json.loads(decoded_val)
+                            changed = False
+                            if "skip" in obj:
+                                obj["skip"] = skip
+                                changed = True
+                            if "limit" in obj:
+                                obj["limit"] = limit
+                                changed = True
+                            if changed:
+                                params[param_key][i] = _uqq(_json.dumps(obj, separators=(",", ":")))
+                                modified = True
+                        except (ValueError, TypeError):
+                            pass
+                if modified:
+                    new_query = _ue(params, doseq=True)
+                    return parsed_u._replace(query=new_query).geturl()
+                # Fallback: regex substitution on raw URL
+                result = _re.sub(r'(%22skip%22%3A)\d+', lambda m: m.group(1) + str(skip), template_url)
+                result = _re.sub(r'(%22limit%22%3A)\d+', lambda m: m.group(1) + str(limit), result)
+                return result
+
+            # Detect limit from the URL
             decoded_for_limit = _up4.unquote(first_api_url)
             limit_match = _re.search(r'"limit"\s*:\s*(\d+)', decoded_for_limit)
             actual_limit = int(limit_match.group(1)) if limit_match else 24
-            print(f"  Detected limit per page: {actual_limit}")
-
-            # Bump limit to 24 for efficiency if it's smaller
             fetch_limit = max(actual_limit, 24)
-            if fetch_limit != actual_limit:
-                print(f"  Bumping limit from {actual_limit} to {fetch_limit} for efficiency")
+            print(f"  Detected limit: {actual_limit}, using: {fetch_limit}")
+
+            # Fetch page 1 with skip=0 and bumped limit
+            page1_url = build_paginated_url(first_api_url, skip=0, limit=fetch_limit)
+            try:
+                r1 = _req.get(page1_url, headers=api_headers, timeout=20)
+                data1 = r1.json()
+                # Re-read total_count from this response if not already set
+                if not total_count:
+                    docs = data1.get("docs", data1)
+                    if isinstance(docs, dict):
+                        total_count = docs.get("count", 0)
+                items1 = parse_items(data1)
+                for item in items1:
+                    if not isinstance(item, dict):
+                        continue
+                    uid = item.get("recid", item.get("id", item.get("title", "")))
+                    if uid not in seen_ids:
+                        seen_ids.add(uid)
+                        all_items.append(item)
+                print(f"  Page 1 (skip=0, limit={fetch_limit}): +{len(items1)} items")
+            except Exception as e:
+                print(f"  Page 1 fetch error: {e}")
 
             if total_count:
                 total_pages = math.ceil(total_count / fetch_limit)
                 print(f"  API reports {total_count} total — fetching {total_pages} pages...")
             else:
-                total_pages = 100  # Safety cap
-                print(f"  No total count — fetching until empty page (max {total_pages})...")
+                total_pages = 100
+                print(f"  No total count — fetching until empty (max {total_pages})...")
 
             print(f"  Template URL: {first_api_url[:120]}...")
 
             for page_num in range(2, total_pages + 1):
                 skip = (page_num - 1) * fetch_limit
-
-                # Helper to do both encoded and decoded replacement
-                def replace_value(url, key_encoded, key_decoded, value):
-                    # Try URL-encoded pattern first
-                    encoded_key = key_encoded
-                    if encoded_key in url:
-                        return _re.sub(
-                            r'(' + encoded_key + r')\d+',
-                            lambda m, v=value: m.group(1) + str(v),
-                            url
-                        )
-                    # Fall back to decoded pattern
-                    return _re.sub(
-                        r'(' + key_decoded + r'\s*:\s*)\d+',
-                        lambda m, v=value: m.group(1) + str(v),
-                        url
-                    )
-
-                paginated_url = replace_value(first_api_url, r'%22skip%22%3A', r'"skip"', skip)
-                paginated_url = replace_value(paginated_url, r'%22limit%22%3A', r'"limit"', fetch_limit)
-
+                paginated_url = build_paginated_url(first_api_url, skip=skip, limit=fetch_limit)
                 print(f"  Fetching page {page_num} (skip={skip})...")
-                # Verify the skip was actually substituted
-                import urllib.parse as _up
-                decoded_check = _up.unquote(paginated_url)
-                if f'"skip":{skip}' in decoded_check or f'%3A{skip}' in paginated_url:
-                    print(f"    Skip substitution: ✓")
-                else:
-                    print(f"    Skip substitution: ✗ — skip value not found in URL")
-                    print(f"    URL snippet: ...{paginated_url[paginated_url.find('skip')-5:paginated_url.find('skip')+20] if 'skip' in paginated_url.lower() else 'skip not in URL'}...")
 
                 try:
                     resp = page.evaluate("""
@@ -748,8 +856,8 @@ def scrape_all_pages(start_url):
         records.append({
             "name":        item.get("title", item.get("name", "")),
             "street":      addr,
-            "city":        item.get("city", city),
-            "state":       item.get("state", "NC"),
+            "city":        item.get("city", ""),
+            "state":       item.get("state", ""),
             "zip":         item.get("zip", ""),
             "phone":       item.get("phone", item.get("phoneNumber", "")),
             "website":     item.get("weburl", item.get("url", item.get("website", ""))),
@@ -760,6 +868,153 @@ def scrape_all_pages(start_url):
     return records
 
 
+# ── Algolia scraper ───────────────────────────────────────────────────────────
+
+def parse_algolia_address(addr_list):
+    """Parse Algolia address list ['Street City', 'ST NNNNN'] into components."""
+    if not addr_list:
+        return "", "", "", ""
+
+    raw0 = str(addr_list[0]).strip() if addr_list[0] else ""
+    city, state, zip_code = "", "", ""
+
+    # Second element: extract state + zip, strip unit/suite noise before city
+    if len(addr_list) > 1 and addr_list[1]:
+        second = str(addr_list[1]).strip()
+        m = re.search(r'\b([A-Z]{2}|[A-Za-z][a-z]+(?: [A-Za-z][a-z]+)?)\s+(\d{5})\b', second)
+        if m:
+            state, zip_code = normalize_state(m.group(1)), m.group(2)
+            city_part = second[:m.start()].strip().rstrip(',').strip()
+            city_part = re.sub(r'^(?:unit|suite|ste|apt|#)\s*\S+\s*', '', city_part, flags=re.I).strip()
+            if city_part and not re.match(r'^\d', city_part):
+                city = city_part
+
+    # Parse street
+    if ',' in raw0:
+        parts = raw0.split(',', 1)
+        street = parts[0].strip()
+        if not city:
+            candidate = parts[1].strip()
+            candidate = re.sub(r'^(?:unit|suite|ste|apt|#)\s*\S+\s*', '', candidate, flags=re.I).strip()
+            if candidate:
+                city = candidate
+    else:
+        street_type = r'\b(Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Drive|Dr|Lane|Ln|Way|Highway|Hwy|Parkway|Pkwy|Court|Ct|Place|Pl|Circle|Cir|Trail|Pike|Run|Broad)\b'
+        matches = list(re.finditer(street_type, raw0, re.I))
+        if matches:
+            last = matches[-1]
+            after = raw0[last.end():].strip().rstrip('.,')
+            num_suffix = re.match(r'^[\d\-]+\s*', after)
+            city_candidate = after[num_suffix.end():].strip() if num_suffix else after
+            if city_candidate and not city:
+                city = city_candidate
+                street = raw0[:raw0.rfind(city_candidate)].strip().rstrip(',').strip()
+            else:
+                street = raw0
+        else:
+            street = raw0
+
+    return street, city, state, zip_code
+
+
+def detect_algolia(url):
+    """Fetch page HTML and extract Algolia config from data-info attribute."""
+    import requests as _req
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        r = _req.get(url, headers=headers, timeout=15)
+        from bs4 import BeautifulSoup as _BS
+        soup = _BS(r.text, "lxml")
+        block = soup.find(attrs={"data-info": True, "data-config": True})
+        if not block:
+            return None
+        info = json.loads(block["data-info"])
+        config = json.loads(block["data-config"])
+        opts = json.loads(block.get("data-options", "{}"))
+        if not info.get("appId") or not info.get("apiKey") or not info.get("index"):
+            return None
+        return {
+            "appId":    info["appId"],
+            "apiKey":   info["apiKey"],
+            "index":    info["index"],
+            "filters":  config.get("filters", ""),
+            "pageSize": int(opts.get("listingsDisplayNumber", 48)),
+        }
+    except Exception as e:
+        print(f"  Algolia detection error: {e}")
+        return None
+
+
+def scrape_algolia(url):
+    """Scrape listings from an Algolia-powered site using the public search API."""
+    import requests as _req
+
+    print(f"  Detecting Algolia config...")
+    cfg = detect_algolia(url)
+    if not cfg:
+        print("  No Algolia config found.")
+        return []
+
+    print(f"  ✓ Algolia index: {cfg['index']}")
+    api_url = f"https://{cfg['appId']}-dsn.algolia.net/1/indexes/{cfg['index']}/query"
+    headers = {
+        "X-Algolia-Application-Id": cfg["appId"],
+        "X-Algolia-API-Key":        cfg["apiKey"],
+    }
+
+    all_records = []
+    page = 0
+    while True:
+        try:
+            r = _req.post(api_url, headers=headers, json={
+                "filters":    cfg["filters"],
+                "hitsPerPage": cfg["pageSize"],
+                "page":        page,
+            }, timeout=15)
+            data = r.json()
+        except Exception as e:
+            print(f"  Algolia fetch error (page {page}): {e}")
+            break
+
+        hits = data.get("hits", [])
+        nb_pages = data.get("nbPages", 1)
+        nb_hits = data.get("nbHits", "?")
+        if not hits:
+            break
+
+        for h in hits:
+            addr_list = h.get("address") or []
+            if isinstance(addr_list, str):
+                addr_list = [addr_list]
+            street, city, state, zip_code = parse_algolia_address(addr_list)
+
+            phone_raw = h.get("phone", "") or ""
+            # Normalize phone
+            digits = re.sub(r'\D', '', phone_raw)
+            if len(digits) == 11 and digits[0] == '1':
+                digits = digits[1:]
+            phone = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}" if len(digits) == 10 else phone_raw
+
+            all_records.append({
+                "name":        h.get("title", ""),
+                "street":      street,
+                "city":        city,
+                "state":       state,
+                "zip":         zip_code,
+                "phone":       phone,
+                "website":     h.get("website", h.get("webUrl", "")),
+                "description": h.get("content", h.get("snippet", "")),
+                "source_url":  url,
+            })
+
+        print(f"  Page {page}: +{len(hits)} (total {len(all_records)} / {nb_hits})")
+        if page >= nb_pages - 1:
+            break
+        page += 1
+
+    return all_records
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -768,79 +1023,96 @@ if __name__ == "__main__":
     print(f"\nScraping: {url}")
     print("Using Playwright (full JS rendering) — this may take 30-60 seconds\n")
 
-    # Known Drupal Views AJAX sites — route directly, skip DOM scraper
-    DRUPAL_VIEWS_SITES = ["visitsavannah.com"]
-    is_drupal = any(s in url for s in DRUPAL_VIEWS_SITES)
+    def is_drupal_views_site(url):
+        """Detect Drupal Views AJAX sites from page HTML — no hardcoded list needed."""
+        import requests as _req
+        try:
+            r = _req.get(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}, timeout=10)
+            html = r.text.lower()
+            return (
+                "drupal" in html
+                and ("views/ajax" in html or "view-content" in html or "views-row" in html)
+            )
+        except Exception:
+            return False
 
-    if is_drupal:
-        print("Detected Drupal Views AJAX site — using AJAX scraper...")
-        records = scrape_drupal_views(url)
-    else:
-        # Try the paginated API version first (SimpleView etc)
+    # Try Algolia first (no browser needed, fastest)
+    print("Checking for Algolia-powered listings...")
+    records = scrape_algolia(url)
+
+    if not records:
+        # Try SimpleView paginated API
         records = scrape_all_pages(url)
 
-        if not records:
-            print("Paginated scrape returned nothing — trying single-page DOM scrape...")
-            records = scrape_simpleview(url)
+    if not records:
+        print("Paginated scrape returned nothing — trying single-page DOM scrape...")
+        records = scrape_simpleview(url)
 
-        # Last resort: Drupal Views AJAX
-        if not records:
-            print("Trying Drupal Views AJAX scraper...")
+    # Last resort: Drupal Views AJAX (auto-detected or forced)
+    if not records:
+        print("Checking for Drupal Views AJAX...")
+        if is_drupal_views_site(url):
+            print("  Drupal Views detected — using AJAX scraper...")
             records = scrape_drupal_views(url)
+        else:
+            print("  Not a Drupal Views site.")
 
     if not records:
         print("No records found. The site structure may have changed.")
         sys.exit(1)
 
-    # Resolution pass for exploregeorgia.org — fetch detail pages for address/phone/website
-    if "exploregeorgia.org" in url:
+    # Generic resolution pass — runs whenever records are missing street addresses
+    # Uses exploregeorgia-specific resolver for that site, generic scraper.py resolver for others
+    missing_addr = [i for i, r in enumerate(records) if not r.get("street") and r.get("website")]
+    if missing_addr:
+        print(f"\nResolution pass — {len(missing_addr)} records missing address, fetching detail pages...")
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        internal_records = [r for r in records if "exploregeorgia.org" in r.get("website", "")]
-        if internal_records:
-            print(f"\nResolving {len(internal_records)} detail pages for address/phone/website...")
-            def resolve_one(record):
-                detail_url = record.get("website", "")
-                if not detail_url:
-                    return record
-                details = resolve_exploregeorgia_detail(detail_url)
-                if details.get("street"):
-                    record["street"] = details["street"]
-                if details.get("city"):
-                    record["city"] = details["city"]
-                if details.get("state"):
-                    record["state"] = details["state"]
-                if details.get("zip"):
-                    record["zip"] = details["zip"]
-                if details.get("phone") and not record.get("phone"):
-                    record["phone"] = details["phone"]
-                if details.get("website"):
-                    record["website"] = details["website"]
+        import requests as _req
+        from bs4 import BeautifulSoup as _BS
+
+        source_domain = urlparse(url).netloc
+
+        def resolve_detail(record):
+            detail_url = record.get("website", "")
+            if not detail_url:
                 return record
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {pool.submit(resolve_one, r): i for i, r in enumerate(records)}
-                done = 0
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        records[idx] = future.result(timeout=15)
-                    except Exception:
-                        pass
-                    done += 1
-                    if done % 10 == 0:
-                        print(f"  Resolved {done}/{len(records)}...")
-            print(f"  Resolution complete.")
+            # Use site-specific resolver if available
+            # Use the generic detail page resolver for all sites
+            details = resolve_detail_page(detail_url)
+            for field in ("street", "city", "state", "zip", "phone"):
+                if details.get(field) and not record.get(field):
+                    record[field] = details[field]
+            if details.get("website") and not record.get("website"):
+                record["website"] = details["website"]
+            return record
 
-    # Save output — filename includes domain + path slug for clarity
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(resolve_detail, records[i]): i for i in missing_addr}
+            done = 0
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    records[idx] = future.result(timeout=15)
+                except Exception:
+                    pass
+                done += 1
+                if done % 10 == 0:
+                    print(f"  Resolved {done}/{len(missing_addr)}...")
+        filled = sum(1 for i in missing_addr if records[i].get("street"))
+        print(f"  Resolution complete — filled {filled}/{len(missing_addr)} missing addresses.")
+
+    # Save output — filename includes domain + path slug + capture date
     parsed = urlparse(url)
     domain = parsed.netloc.replace("www.", "").replace(".", "_")
     path_slug = parsed.path.strip("/").replace("/", "_") or "listings"
-    # Save to ../data/ folder relative to this script's location
     import os as _os
+    from datetime import date as _date
+    datestamp = _date.today().strftime("%Y-%m-%d")
     script_dir = _os.path.dirname(_os.path.abspath(__file__))
     data_dir = _os.path.join(script_dir, "..", "data")
     _os.makedirs(data_dir, exist_ok=True)
-    output_file = _os.path.join(data_dir, f"{domain}_{path_slug}_playwright.csv")
+    output_file = _os.path.join(data_dir, f"{domain}_{path_slug}_{datestamp}.csv")
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)

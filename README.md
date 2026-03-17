@@ -20,6 +20,8 @@ scraper/
   clients/
     scraper-client.ts   # Deno/TypeScript client for calling the API
                         # Copy this into your Deno app when ready
+  data/
+    .gitkeep            # CSVs from playwright_scraper.py save here (gitignored)
 ```
 
 ---
@@ -28,7 +30,7 @@ scraper/
 
 ### Base URL
 ```
-https://your-app-name.fly.dev
+https://daytrip-web-scraper.fly.dev
 ```
 
 ### Authentication
@@ -98,7 +100,7 @@ if (result.success) {
 
 Set these environment variables in your Deno app:
 ```
-SCRAPER_API_URL=https://your-app-name.fly.dev
+SCRAPER_API_URL=https://daytrip-web-scraper.fly.dev
 SCRAPER_API_KEY=your-secret-key
 ```
 
@@ -133,13 +135,13 @@ The scraper auto-detects the site structure and applies the appropriate pattern.
 **Pagination:** single page (all results in one HTML response)
 **URL pattern:** `business.[chamber].org/local-business-directory/Search/[category]`
 
-### Pattern 5 — Editorial prose style (Wilmington / DiscoverDurham directory)
+### Pattern 5 — Editorial prose style
 **Sites:** `visitwilmingtonnc.com`, `discoverdurham.com/food-drink/restaurants/`
 **Structure:** `<strong>` name + sibling text lines for address/phone, or multi-line `<br>`-separated blocks
 **Extracts:** name, street, city, state, zip (when on separate line), phone, website
 **Pagination:** `?page=N` for discoverdurham.com, `?pg=N` for others
 
-### Pattern 6 — Blog/article listing style (DiscoverDurham new restaurants)
+### Pattern 6 — Blog/article listing style
 **Sites:** `discoverdurham.com/food-drink/restaurants/new-restaurants/` and similar editorial pages
 **Structure:** `<h3><a href="website">` name + `<p><strong>` address + `<p>` description
 **Extracts:** name, street, phone, website, description
@@ -150,6 +152,19 @@ The scraper auto-detects the site structure and applies the appropriate pattern.
 **Structure:** `<a href="/detail/">` wrapping `<h2>` name + `<p>` address + `<p>` description
 **Extracts:** name, street, city, state, zip, website (detail URL), description
 **Pagination:** single page (JS filter operates on pre-loaded HTML)
+
+### Pattern 8 — JBusiness Directory style
+**Sites:** `charleston.com/eating-and-drinking/restaurants`
+**Structure:** `<a href="*/businesses/*"><h3>` name + sibling `<p>` for location
+**Extracts:** name, city, detail URL (resolution pass fetches street/phone/real website)
+**Pagination:** `?start=20`, `?start=40` etc. (Joomla pagination)
+**Note:** Performs a parallel resolution pass on detail pages to get full address/phone/website
+
+### Pattern 9 — Plain h3 editorial prose style
+**Sites:** `gosouthsavannah.com` and similar static HTML travel guides
+**Structure:** `<h3>` plain text name (no link inside) + sibling address text + sibling `<a>` for website + `<p>` description
+**Extracts:** name, street, phone, website, description
+**Pagination:** single page
 
 ### SimpleView CMS
 **Sites:** `visitchapelhill.org`, `visitraleigh.com`, `visitdurham.com`, `visitcary.org`
@@ -171,14 +186,24 @@ The scraper auto-detects the site structure and applies the appropriate pattern.
 | `discoverdurham.com/food-drink/restaurants/` | 5 | 534 listings, 45 pages |
 | `discoverdurham.com/food-drink/restaurants/new-restaurants/` | 6 | ~25 listings, no pagination |
 | `ncwine.org/wineries/wineries-main/` | 7 | All NC wineries, single page |
+| `charleston.com/eating-and-drinking/restaurants` | 8 | 30 listings, resolution pass for address |
+| `gosouthsavannah.com/historic-district-and-city/historic-architecture/places-of-worship.html` | 9 | Static HTML travel guide |
 
-## Sites that require Playwright locally
+## Sites known to work via Playwright (CLI only)
+
+| URL | Method | Notes |
+|---|---|---|
+| `visitchapelhill.org` | SimpleView XHR intercept | ~180 listings |
+| `visitraleigh.com` | SimpleView XHR intercept | ~700+ listings |
+| `exploregeorgia.org/spas-wellness` | DOM + detail page resolution | 63 listings |
+| `visitsavannah.com/savannahs-best-restaurants` | Drupal Views AJAX | ~244 listings |
+| `charlestoncvb.com` | DOM pagination | bot detection may interfere |
+
+## Sites that require Playwright and need further work
 
 | URL | Reason |
 |---|---|
-| `visitchapelhill.org` | SimpleView — requires live browser session |
-| `visitraleigh.com` | SimpleView — requires live browser session |
-| `exploreasheville.com` | JS-rendered |
+| `exploreasheville.com` | JS-rendered, no API endpoint found |
 | `explorebrevard.com` | JS-rendered + Load More AJAX |
 
 ---
@@ -216,6 +241,8 @@ All records use this schema:
 - "Visit Website" anchor with the real URL
 - Repeating `<ul><li>` or `<p>` blocks per listing
 
+**For JS-rendered sites:** Open DevTools → Network → XHR/Fetch, interact with the page, and look for an API endpoint firing. If it's a SimpleView, Drupal Views, or other known CMS, add the domain to the appropriate handler in `playwright_scraper.py`.
+
 ---
 
 ## Local development
@@ -227,19 +254,20 @@ pip install -r requirements.txt
 uvicorn api:app --reload --port 8080
 ```
 
-### CLI scraper
+### CLI scraper (plain HTML sites)
 ```bash
 cd scripts
 python3 scraper.py https://downtowndurham.com/dine-drink/
-# Outputs: downtowndurham_com_dine-drink_listings.csv
+# Outputs CSV to scripts/ folder
 ```
 
-### Playwright scraper (for JS-rendered sites)
+### Playwright scraper (JS-rendered sites)
 ```bash
 cd scripts
-pip install playwright
+pip install playwright --break-system-packages
 playwright install chromium
 python3 playwright_scraper.py https://visitchapelhill.org/things-to-do
+# Outputs CSV to ../data/ folder
 ```
 
 ### Merge two scrape runs
@@ -270,8 +298,8 @@ fly deploy
 
 ### Secrets
 ```bash
-fly secrets set API_KEY=your-secret-key
-fly secrets set ALLOWED_ORIGINS=https://your-deno-app.com
+fly secrets set API_KEY=your-secret-key -a daytrip-web-scraper
+fly secrets set ALLOWED_ORIGINS=https://your-deno-app.com -a daytrip-web-scraper
 ```
 
 ---

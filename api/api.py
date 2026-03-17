@@ -621,6 +621,61 @@ def parse_listings(soup):
         if records:
             return records, "charleston-style"
 
+
+    # Pattern 9: GoSouthSavannah / editorial h3 prose style
+    # h3 plain text name (no link inside) + next sibling text line for address + sibling <a> for website
+    # Used by gosouthsavannah.com and similar static HTML travel guides
+    # Structure: <h3>Name</h3> plain address text <a href="website">Official website</a> <p>description</p>
+    body_h3s = [h3 for h3 in soup.find_all("h3")
+                if not h3.find("a")  # plain text h3, no link inside
+                and h3.get_text(strip=True)
+                and len(h3.get_text(strip=True)) < 80
+                and not h3.find_parent("nav")
+                and not h3.find_parent("header")
+                and not h3.find_parent("footer")]
+    if body_h3s:
+        for h3 in body_h3s:
+            name = h3.get_text(strip=True)
+            if not name:
+                continue
+            street = ""
+            website = ""
+            description = ""
+            phone = ""
+            node = h3.next_sibling
+            while node:
+                if hasattr(node, "name"):
+                    if node.name in ("h2", "h3"):
+                        break
+                    if node.name == "a":
+                        href = node.get("href", "")
+                        text = node.get_text(strip=True)
+                        if href.startswith("tel:"):
+                            phone = extract_phone(href)
+                        elif href.startswith("http") and not any(
+                                s in href for s in ["facebook", "instagram", "twitter"]):
+                            website = href
+                    elif node.name == "p":
+                        text = node.get_text(strip=True)
+                        if not description and len(text) > 20:
+                            description = text[:200]
+                else:
+                    text = str(node).strip()
+                    if text and not street:
+                        addr = extract_address_from_text(text)
+                        if addr:
+                            street = clean_address(addr)
+                        elif not phone:
+                            phone = extract_phone(text)
+                node = node.next_sibling
+            if name and (street or website):
+                records.append({
+                    "name": name, "street": street, "phone": phone,
+                    "website": website, "description": description,
+                })
+        if records:
+            return records, "prose-h3-style"
+
     return [], None
 
 

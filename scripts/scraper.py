@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
 
 def resolve_charleston_detail(detail_url):
@@ -275,14 +275,49 @@ def parse_listings(soup):
         return records, "chapelhill-style"
 
     # Pattern 3: Hillsborough-style — <a> wrapping <h3>
+    # Exclude nav/header/footer to avoid picking up menu links
     for a in soup.select("a"):
+        if a.find_parent(["nav", "header", "footer"]):
+            continue
         h3 = a.find("h3")
         if not h3:
             continue
         name = h3.get_text(strip=True)
+        if not name or len(name) > 80:
+            continue
         desc_el = a.find("p")
-        records.append({"name": name, "street": "", "phone": "", "website": a.get("href", ""),
-                        "description": desc_el.get_text(strip=True) if desc_el else ""})
+        # Extract address from card-footer or any div/p with address-like text
+        street = city = state = zip_code = ""
+        # Prioritise card-footer, then fall back to all divs/p/span
+        candidates = (
+            a.find_all(class_=lambda c: c and "footer" in " ".join(c) if c else False)
+            or a.find_all(["div", "p", "span", "footer"])
+        )
+        for candidate in candidates:
+            # Normalise all whitespace (newlines, multiple spaces) to single space
+            raw = candidate.get_text(separator=" ", strip=True)
+            text = re.sub(r"\s+", " ", raw).strip()
+            # Match "Street, City, ST, ZIP" or "Street, City, ST ZIP"
+            m = re.match(
+                r"^(.+?),\s*([^,]+?),\s*([A-Z]{2}),?\s*(\d{5})\s*$",
+                text
+            )
+            if m:
+                street   = m.group(1).strip()
+                city     = m.group(2).strip()
+                state    = m.group(3).strip()
+                zip_code = m.group(4).strip()
+                break
+            # Fallback: just try to extract a street address
+            if not street:
+                addr = extract_address_from_text(text)
+                if addr:
+                    street = clean_address(addr)
+        records.append({
+            "name": name, "street": street, "city": city, "state": state,
+            "zip": zip_code, "phone": "", "website": a.get("href", ""),
+            "description": desc_el.get_text(strip=True) if desc_el else "",
+        })
     if records:
         return records, "hillsborough-style"
 
@@ -564,6 +599,74 @@ def parse_listings(soup):
         if records:
             return records, "charleston-style"
 
+
+    # Pattern 9: GoSouthSavannah / editorial h3 prose style
+    # h3 plain text name (no link inside) + next sibling text line for address + sibling <a> for website
+    # Used by gosouthsavannah.com and similar static HTML travel guides
+    # Structure: <h3>Name</h3> plain address text <a href="website">Official website</a> <p>description</p>
+    body_h3s = [h3 for h3 in soup.find_all("h3")
+                if not h3.find("a")  # plain text h3, no link inside
+                and h3.get_text(strip=True)
+                and len(h3.get_text(strip=True)) < 80
+                and not h3.find_parent("nav")
+                and not h3.find_parent("header")
+                and not h3.find_parent("footer")]
+    if body_h3s:
+        for h3 in body_h3s:
+            name = h3.get_text(strip=True)
+            if not name:
+                continue
+            street = ""
+            website = ""
+            description = ""
+            phone = ""
+            node = h3.next_sibling
+            while node:
+                # NavigableString.name is None — use that to distinguish text from tags
+                if getattr(node, "name", None) is None:
+                    text = str(node).strip()
+                    if text and not street:
+                        addr = extract_address_from_text(text)
+                        if addr:
+                            street = clean_address(addr)
+                        elif not phone:
+                            phone = extract_phone(text)
+                else:
+                    if node.name in ("h2", "h3"):
+                        break
+                    if node.name == "a":
+                        href = node.get("href", "")
+                        text = node.get_text(strip=True)
+                        if href.startswith("tel:"):
+                            phone = extract_phone(href)
+                        elif href.startswith("http") and not any(
+                                s in href for s in ["facebook", "instagram", "twitter"]):
+                            website = href
+                    elif node.name == "p":
+                        text = node.get_text(strip=True)
+                        # Try address extraction first before treating as description
+                        if not street:
+                            addr = extract_address_from_text(text)
+                            if addr:
+                                street = clean_address(addr)
+                                # Rest of text after address is description context
+                                after = text[text.find(addr) + len(addr):].strip().lstrip(",").strip()
+                                if after and len(after) > 10 and not description:
+                                    description = after[:200]
+                                continue
+                        if not description and len(text) > 20:
+                            description = text[:200]
+                node = node.next_sibling
+            if name:  # accept name-only; resolution pass fills in the rest
+                records.append({
+                    "name": name, "street": street, "phone": phone,
+                    "website": website, "description": description,
+                })
+        # Only return if at least some records have substance (avoid nav-scraping)
+        substantial = [r for r in records if r.get("street") or r.get("website") or r.get("phone")]
+        if records and (substantial or len(records) >= 3):
+            return records, "prose-h3-style"
+
     return [], None
 
 
@@ -578,11 +681,23 @@ def scrape_html(start_url, log=print):
         if page == 1:
             url = start_url
         elif "discoverdurham.com" in start_url:
-            url = f"{start_url}?page={page}&"
+            sep = "&" if "?" in start_url else "?"
+            url = f"{start_url}{sep}page={page}&"
         elif "charleston.com" in start_url:
-            url = f"{start_url}?start={(page-1)*20}"
+            sep = "&" if "?" in start_url else "?"
+            url = f"{start_url}{sep}start={(page-1)*20}"
         else:
-            url = f"{start_url}?pg={page}"
+            # Build paginated URL by injecting page param, preserving existing query params
+            from urllib.parse import urlparse as _ulp, parse_qs as _pqs, urlencode as _ue, urlunparse as _uu
+            _p = _ulp(start_url)
+            _params = _pqs(_p.query, keep_blank_values=True)
+            # Remove any existing page/pg param to avoid conflicts
+            _params.pop("page", None)
+            _params.pop("pg", None)
+            # Prepend page param so it appears first (some CMSes require this)
+            _new_params = {"page": [str(page)]}
+            _new_params.update(_params)
+            url = _uu(_p._replace(query=_ue(_new_params, doseq=True)))
         log(f"  Fetching page {page}...")
         try:
             soup = fetch_soup(url)
@@ -624,19 +739,43 @@ def resolve_website(record, source_domain):
     SKIP = [source_domain, "facebook.com", "instagram.com", "twitter.com",
             "yelp.com", "google.com", "tripadvisor.com",
             "linkedin.com", "tiktok.com", "youtube.com", "pinterest.com"]
+    SOCIAL = ["facebook.com", "instagram.com", "twitter.com", "x.com",
+              "linkedin.com", "tiktok.com", "youtube.com", "pinterest.com",
+              "m.facebook.com"]
     try:
         full_url = website if website.startswith("http") else f"https://{source_domain}{website}"
         r = requests.get(full_url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "lxml")
 
-        # Remove nav, footer, header before scanning — those contain site-wide links
-        # that appear on every page and aren't business-specific
+        # Remove nav, footer, header before scanning
         for tag in soup.find_all(["nav", "footer", "header"]):
             tag.decompose()
 
-        # Collect footer-domain patterns by checking what appears repeatedly
-        # across the nav/footer (already removed above)
+        # Extract phone from tel: link if not already set
+        if not record.get("phone"):
+            for a in soup.find_all("a", href=True):
+                if a["href"].startswith("tel:"):
+                    phone = extract_phone(a["href"])
+                    if phone:
+                        record["phone"] = phone
+                        break
 
+        # Extract address from Google Maps query= param if not already set
+        if not record.get("street"):
+            from urllib.parse import parse_qs as _pqs, urlparse as _ulp, unquote as _uq
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if "google.com/maps" in href and "query=" in href:
+                    qs = _pqs(_ulp(href).query)
+                    query_val = qs.get("query", [""])[0]
+                    if query_val:
+                        # query= is "Street, City ST ZIP" — split off street
+                        addr = _uq(query_val).split(",")[0].strip()
+                        if addr and re.search(r"\d", addr):
+                            record["street"] = addr
+                    break
+
+        # Fallback address: scan page text
         if not record.get("street"):
             for tag in soup.find_all(["p", "li", "div", "span", "address"]):
                 text = tag.get_text(separator=" ", strip=True)
@@ -649,7 +788,7 @@ def resolve_website(record, source_domain):
                         record["street"] = extracted
                         break
 
-        # First pass: prefer labelled outbound links in the page body
+        # First pass: prefer labelled outbound links (real website)
         for a in soup.find_all("a", href=True):
             href = a["href"]
             href_domain = urlparse(href).netloc
@@ -660,7 +799,7 @@ def resolve_website(record, source_domain):
                 record["website"] = href
                 return record
 
-        # Second pass: first clean outbound link in body
+        # Second pass: first clean outbound non-social link
         for a in soup.find_all("a", href=True):
             href = a["href"]
             href_domain = urlparse(href).netloc
@@ -669,6 +808,15 @@ def resolve_website(record, source_domain):
             if href.startswith("http"):
                 record["website"] = href
                 return record
+
+        # Third pass: accept social link as website if nothing else found
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            href_domain = urlparse(href).netloc
+            if href.startswith("http") and any(s in href_domain for s in SOCIAL):
+                record["website"] = href
+                return record
+
     except Exception as e:
         record["_resolve_error"] = str(e)[:80]
     return record
@@ -693,6 +841,14 @@ def resolve_all(records, source_domain, log=print):
             if done % 20 == 0:
                 log(f"  Resolved {done}/{len(internal)}...")
     errors = sum(1 for r in records if r.get("_resolve_error"))
+    # Clear any website fields that still point to the source domain — these are
+    # internal detail page links that had no outbound business website on them
+    for r in records:
+        w = r.get("website", "")
+        if w:
+            netloc = urlparse(w).netloc
+            if not netloc or netloc == source_domain:
+                r["website"] = ""
     still_internal = sum(1 for r in records if urlparse(r.get("website", "")).netloc == source_domain)
     if errors:
         log(f"  Warning: {errors} resolution(s) failed")
@@ -719,8 +875,16 @@ def main():
     url = sys.argv[1].strip() if len(sys.argv) > 1 else input("Enter URL to scrape: ").strip()
     if not url.startswith("http"):
         url = "https://" + url
-    domain = urlparse(url).netloc.replace("www.", "").replace(".", "_")
-    output_file = f"{domain}_listings.csv"
+    from datetime import date as _date
+    import os as _os
+    parsed = urlparse(url)
+    domain = parsed.netloc.replace("www.", "").replace(".", "_")
+    path_slug = parsed.path.strip("/").replace("/", "_") or "listings"
+    datestamp = _date.today().strftime("%Y-%m-%d")
+    script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    data_dir = _os.path.join(script_dir, "..", "data")
+    _os.makedirs(data_dir, exist_ok=True)
+    output_file = _os.path.join(data_dir, f"{domain}_{path_slug}_{datestamp}.csv")
     print(f"\nScraping: {url}")
     print(f"Output:   {output_file}\n")
     records, js_detected = scrape(url)
