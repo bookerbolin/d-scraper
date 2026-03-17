@@ -81,6 +81,75 @@ def extract_phone(text):
     return ""
 
 
+def resolve_exploregeorgia_detail(detail_url, source_domain="exploregeorgia.org"):
+    """Fetch an exploregeorgia.org detail page and extract address/phone/website."""
+    import requests as _req
+    from bs4 import BeautifulSoup as _BS
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
+    try:
+        r = _req.get(detail_url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        soup = _BS(r.text, "lxml")
+
+        result = {}
+
+        # Website — "Visit Website" link
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            text = a.get_text(strip=True)
+            if ("Visit Website" in text and href.startswith("http")
+                    and source_domain not in href):
+                result["website"] = href
+                break
+
+        # Phone — tel: link
+        tel = soup.find("a", href=re.compile(r"^tel:"))
+        if tel:
+            digits = re.sub(r"\D", "", tel["href"].replace("tel:", ""))
+            if len(digits) == 10:
+                result["phone"] = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+
+        # Location block
+        location_heading = soup.find(["h2", "h3"], string=re.compile(r"Location", re.I))
+        if location_heading:
+            lines = []
+            for sib in location_heading.find_next_siblings():
+                if sib.name in ("h2", "h3"):
+                    break
+                text = sib.get_text(strip=True)
+                if text:
+                    lines.append(text)
+
+            street_lines = []
+            city = state = zip_code = ""
+            for line in lines:
+                if re.match(r"^[A-Z]{2}$", line):
+                    state = line
+                elif re.match(r"^\d{5}$", line):
+                    zip_code = line
+                elif not state and not zip_code:
+                    street_lines.append(line)
+
+            if len(street_lines) > 1:
+                city = street_lines[-1]
+                result["street"] = ", ".join(street_lines[:-1])
+            elif street_lines:
+                city = street_lines[0]
+                result["street"] = ""
+
+            if city:
+                result["city"] = city
+            if state:
+                result["state"] = state
+            if zip_code:
+                result["zip"] = zip_code
+
+        return result
+    except Exception as e:
+        return {}
+
+
+
 def scrape_simpleview(start_url):
     """
     Scrape a SimpleView CMS site by intercepting its XHR API calls
@@ -167,40 +236,95 @@ def scrape_simpleview(start_url):
                     })
 
         else:
-            # Fallback: parse the rendered DOM directly
+            # Fallback: parse the rendered DOM with pagination support
             print("No API responses intercepted — parsing rendered DOM...")
-            html = page.content()
 
             from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "lxml")
 
-            # Look for listing cards — SimpleView renders them with consistent classes
-            cards = (
-                soup.select(".sv-listing-card") or
-                soup.select(".listing-card") or
-                soup.select("[class*='listing']") or
-                soup.select("article")
-            )
+            def parse_page_cards(html, parsed_netloc):
+                soup = BeautifulSoup(html, "lxml")
+                cards = (
+                    soup.select(".sv-listing-card") or
+                    soup.select(".listing-card") or
+                    soup.select("[class*='listing']") or
+                    soup.select("article")
+                )
+                results = []
+                for card in cards:
+                    name_el = card.select_one("h2, h3, .listing-title, [class*='title']")
+                    name = name_el.get_text(strip=True) if name_el else ""
+                    if not name:
+                        continue
 
-            print(f"Found {len(cards)} potential listing cards in DOM")
+                    text = card.get_text(separator=" ", strip=True)
+                    street = clean_address(extract_address_from_text(text))
 
-            for card in cards:
-                name_el = card.select_one("h2, h3, .listing-title, [class*='title']")
-                name = name_el.get_text(strip=True) if name_el else ""
-                if not name:
-                    continue
+                    # Capture city-only locations (e.g. "Savannah", "St. Simons Island")
+                    # when no street address found
+                    card_city = ""
+                    if not street:
+                        import re as _re
+                        # Look for short text lines that look like city names
+                        # (no digits, not a category tag, 2-5 words)
+                        for line in text.split("  "):
+                            line = line.strip()
+                            if (line and not _re.search(r'\d', line)
+                                    and 2 <= len(line.split()) <= 5
+                                    and len(line) < 40
+                                    and line.lower() not in ["visit website", "day spas",
+                                        "hotels & motels", "spas", "wellness", "resort"]):
+                                card_city = line
+                                break
 
-                # Try to find address
-                text = card.get_text(separator=" ", strip=True)
-                street = clean_address(extract_address_from_text(text))
+                    link = card.select_one("a[href^='http']:not([href*='" + parsed_netloc + "'])")
+                    website = link["href"] if link else ""
 
-                # Try to find website link
-                link = card.select_one("a[href^='http']:not([href*='" + parsed.netloc + "'])")
-                website = link["href"] if link else ""
+                    phone_el = card.select_one("a[href^='tel:']")
+                    phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
+
+                    results.append({
+                        "name": name, "street": street, "card_city": card_city,
+                        "website": website, "phone": phone,
+                    })
+                return results, soup
+
+            # Parse first page
+            html = page.content()
+            page_cards, soup = parse_page_cards(html, parsed.netloc)
+            print(f"Found {len(page_cards)} potential listing cards on page 1")
+            all_dom_cards = page_cards
+
+            # Try to paginate via next button
+            page_num = 1
+            while True:
+                next_btn = page.query_selector("a[rel='next'], .pager__item--next a, [class*='next'] a, a:has-text('Next'), button:has-text('Next')")
+                if not next_btn:
+                    break
+                page_num += 1
+                print(f"  Clicking to page {page_num}...")
+                next_btn.click()
+                page.wait_for_load_state("networkidle", timeout=15000)
+                time.sleep(1)
+                html = page.content()
+                page_cards, _ = parse_page_cards(html, parsed.netloc)
+                if not page_cards:
+                    break
+                print(f"  Found {len(page_cards)} cards on page {page_num}")
+                all_dom_cards.extend(page_cards)
+
+            print(f"Total DOM cards across all pages: {len(all_dom_cards)}")
+
+            for card_data in all_dom_cards:
+                name = card_data["name"]
+                street = card_data["street"]
+                card_city = card_data.get("card_city", "") or city
+                phone = card_data.get("phone", "")
+                website = card_data.get("website", "")
 
                 all_records.append({
-                    "name": name, "street": street, "city": city,
-                    "state": "NC", "zip": "", "website": website,
+                    "name": name, "street": street,
+                    "city": card_city, "state": "", "zip": "",
+                    "phone": phone, "website": website,
                     "description": "", "source_url": start_url,
                 })
 
@@ -467,6 +591,45 @@ if __name__ == "__main__":
     if not records:
         print("No records found. The site structure may have changed.")
         sys.exit(1)
+
+    # Resolution pass for exploregeorgia.org — fetch detail pages for address/phone/website
+    if "exploregeorgia.org" in url:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        internal_records = [r for r in records if "exploregeorgia.org" in r.get("website", "")]
+        if internal_records:
+            print(f"\nResolving {len(internal_records)} detail pages for address/phone/website...")
+            def resolve_one(record):
+                detail_url = record.get("website", "")
+                if not detail_url:
+                    return record
+                details = resolve_exploregeorgia_detail(detail_url)
+                if details.get("street"):
+                    record["street"] = details["street"]
+                if details.get("city"):
+                    record["city"] = details["city"]
+                if details.get("state"):
+                    record["state"] = details["state"]
+                if details.get("zip"):
+                    record["zip"] = details["zip"]
+                if details.get("phone") and not record.get("phone"):
+                    record["phone"] = details["phone"]
+                if details.get("website"):
+                    record["website"] = details["website"]
+                return record
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(resolve_one, r): i for i, r in enumerate(records)}
+                done = 0
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        records[idx] = future.result(timeout=15)
+                    except Exception:
+                        pass
+                    done += 1
+                    if done % 10 == 0:
+                        print(f"  Resolved {done}/{len(records)}...")
+            print(f"  Resolution complete.")
 
     # Save output — filename includes domain + path slug for clarity
     parsed = urlparse(url)
