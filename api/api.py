@@ -89,6 +89,46 @@ class ScrapeResponse(BaseModel):
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
 
+
+def resolve_charleston_detail(detail_url):
+    """Fetch a charleston.com/businesses/ detail page and extract address/phone/website."""
+    try:
+        r = requests.get(detail_url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        # Remove nav/footer noise
+        for tag in soup.find_all(["nav", "footer", "header"]):
+            tag.decompose()
+        result = {}
+        # Website — first outbound link not on charleston.com
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and "charleston.com" not in href and                not any(s in href for s in ["facebook", "instagram", "twitter",
+                                           "yelp", "google", "tripadvisor"]):
+                result["website"] = href
+                break
+        # Phone
+        tel = soup.find("a", href=re.compile(r"^tel:"))
+        if tel:
+            result["phone"] = extract_phone(tel["href"])
+        # Address — scan for structured address block or text
+        for tag in soup.find_all(["p", "div", "span", "address"]):
+            text = tag.get_text(separator=" ", strip=True)
+            if looks_like_address(text):
+                result["street"] = clean_address(text)
+                break
+            elif len(text) > 30:
+                extracted = extract_address_from_text(text)
+                if extracted:
+                    result["street"] = extracted
+                    break
+        return result
+    except Exception:
+        return {}
+
+
+
+
 def extract_phone(text):
     """Extract first phone number from text. Returns (XXX) XXX-XXXX format."""
     tel_match = re.search(r'tel:\+?1?(\d{10})', text)
@@ -554,6 +594,33 @@ def parse_listings(soup):
         if records:
             return records, "card-link-style"
 
+
+    # Pattern 8: Charleston.com / JBusiness Directory style
+    # <a href="*businesses/*"><h3>name</h3></a> + sibling <p> for location
+    # Detail pages at charleston.com/businesses/slug have full address/phone/website.
+    # Pagination: ?start=20, ?start=40 etc.
+    charleston_links = [a for a in soup.find_all("a", href=re.compile(r"businesses/"))
+                        if a.find("h3") and not a.find_parent("nav")]
+    if charleston_links:
+        for a in charleston_links:
+            h3 = a.find("h3")
+            if not h3:
+                continue
+            name = h3.get_text(strip=True)
+            if not name or len(name) > 100:
+                continue
+            detail_url = a.get("href", "")
+            # Location text in next sibling element
+            loc_el = a.find_next_sibling(["p", "div", "span"])
+            location = loc_el.get_text(strip=True) if loc_el else ""
+            city = location.split(",")[0].strip() if location else ""
+            records.append({
+                "name": name, "street": "", "phone": "", "city": city,
+                "state": "SC", "zip": "", "website": detail_url, "description": "",
+            })
+        if records:
+            return records, "charleston-style"
+
     return [], None
 
 
@@ -564,11 +631,13 @@ def scrape_html(start_url):
     page = 1
     js_detected = False
     while page <= MAX_PAGES:
-        # Try both common pagination params
+        # Try multiple pagination styles
         if page == 1:
             url = start_url
         elif "discoverdurham.com" in start_url:
             url = f"{start_url}?page={page}&"
+        elif "charleston.com" in start_url:
+            url = f"{start_url}?start={(page-1)*20}"
         else:
             url = f"{start_url}?pg={page}"
         try:
@@ -695,6 +764,28 @@ async def scrape(
         records, js_detected, message = run_scrape(url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scrape failed: {str(e)}")
+
+    # Resolution pass for charleston.com detail pages
+    if "charleston.com" in url:
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        internal = [i for i, r in enumerate(records)
+                    if r.get("website") and "charleston.com/businesses" in r["website"]]
+        if internal:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(resolve_charleston_detail, records[i]["website"]): i
+                           for i in internal}
+                for future in _as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        details = future.result(timeout=15)
+                        if details.get("street"):
+                            records[idx]["street"] = details["street"]
+                        if details.get("phone") and not records[idx].get("phone"):
+                            records[idx]["phone"] = details["phone"]
+                        if details.get("website"):
+                            records[idx]["website"] = details["website"]
+                    except Exception:
+                        pass
 
     # Ensure all records have all fields
     clean = []

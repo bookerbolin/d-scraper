@@ -150,6 +150,161 @@ def resolve_exploregeorgia_detail(detail_url, source_domain="exploregeorgia.org"
 
 
 
+def scrape_drupal_views(start_url):
+    """
+    Scrape a Drupal Views AJAX pagination site (e.g. visitsavannah.com).
+    Intercepts the first AJAX call to capture session tokens, then replays
+    with page=0,1,2... until empty.
+    """
+    import json as _json
+    from bs4 import BeautifulSoup as _BS
+    from urllib.parse import urlparse as _up, urlencode as _ue, parse_qs as _pqs, urlunparse as _uu
+
+    parsed = urlparse(start_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    city = parsed.netloc.replace("www.", "").replace("visit", "").replace(".org", "").replace(".com", "").title()
+
+    first_ajax_url = None
+    all_records = []
+
+    print(f"Launching browser for Drupal Views: {start_url}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+
+        # Intercept the Drupal Views AJAX endpoint
+        def handle_response(response):
+            nonlocal first_ajax_url
+            if "views/ajax" in response.url and "drupal_ajax" in response.url:
+                if first_ajax_url is None:
+                    first_ajax_url = response.url
+                    print(f"  Captured Drupal Views AJAX URL")
+
+        page.on("response", handle_response)
+
+        print("Loading page...")
+        page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+
+        # Scroll to trigger the first AJAX load
+        print("Scrolling to trigger AJAX...")
+        for _ in range(5):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            time.sleep(1)
+
+        # Try clicking "next" to capture the AJAX URL if not yet captured
+        if not first_ajax_url:
+            next_btn = page.query_selector("a[rel='next'], .pager__item--next a, li.next a")
+            if next_btn:
+                page.evaluate("btn => btn.click()", next_btn)
+                time.sleep(2)
+
+        browser.close()
+
+    if not first_ajax_url:
+        print("  Could not capture Drupal Views AJAX URL")
+        return []
+
+    # Parse the captured URL to extract base params
+    from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs, urlencode as _urlencode
+    parsed_ajax = _urlparse(first_ajax_url)
+    params = _parse_qs(parsed_ajax.query, keep_blank_values=True)
+
+    # Flatten params (parse_qs returns lists)
+    flat_params = {k: v[0] for k, v in params.items()}
+
+    print(f"  view_name: {flat_params.get('view_name', '?')} | display: {flat_params.get('view_display_id', '?')}")
+
+    HEADERS_AJAX = {
+        **HEADERS,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json",
+        "Referer": start_url,
+    }
+
+    import requests as _req
+
+    page_num = 0
+    seen_names = set()
+
+    while True:
+        flat_params["page"] = str(page_num)
+        ajax_url = f"{parsed_ajax.scheme}://{parsed_ajax.netloc}{parsed_ajax.path}?{_urlencode(flat_params)}"
+
+        try:
+            r = _req.get(ajax_url, headers=HEADERS_AJAX, timeout=20)
+            r.raise_for_status()
+            commands = r.json()
+        except Exception as e:
+            print(f"  Page {page_num} fetch error: {e}")
+            break
+
+        # Find the insert command with listing HTML
+        html_content = ""
+        for cmd in commands:
+            if isinstance(cmd, dict) and cmd.get("command") == "insert" and "data" in cmd:
+                html_content = cmd["data"]
+                break
+
+        if not html_content or len(html_content) < 100:
+            print(f"  Page {page_num}: empty response — done")
+            break
+
+        soup = _BS(html_content, "lxml")
+
+        # Parse listing cards from the injected HTML
+        # visitsavannah uses article/profile cards with h3 name + address fields
+        new_count = 0
+        cards = soup.select("article, .profile-card, [class*='listing'], [class*='profile']")
+        if not cards:
+            # Fallback: any h3 with a link
+            cards = [h3.find_parent() for h3 in soup.find_all("h3") if h3.find("a")]
+
+        for card in (cards or []):
+            if not card:
+                continue
+            name_el = card.select_one("h3 a, h2 a, .field-title a, [class*='title'] a")
+            if not name_el:
+                name_el = card.select_one("h3, h2")
+            if not name_el:
+                continue
+            name = name_el.get_text(strip=True)
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            new_count += 1
+
+            detail_url = ""
+            a = name_el if name_el.name == "a" else name_el.find("a")
+            if a and a.get("href"):
+                href = a["href"]
+                detail_url = href if href.startswith("http") else base + href
+
+            text = card.get_text(separator=" ", strip=True)
+            street = clean_address(extract_address_from_text(text)) if extract_address_from_text(text) else ""
+            phone = extract_phone(text)
+
+            all_records.append({
+                "name": name, "street": street, "city": city,
+                "state": "GA", "zip": "", "phone": phone,
+                "website": detail_url, "description": "",
+                "source_url": start_url,
+            })
+
+        print(f"  Page {page_num}: +{new_count} new listings (total: {len(all_records)})")
+        if new_count == 0:
+            break
+        page_num += 1
+        time.sleep(0.5)
+
+    return all_records
+
+
+
 def scrape_simpleview(start_url):
     """
     Scrape a SimpleView CMS site by intercepting its XHR API calls
@@ -207,7 +362,8 @@ def scrape_simpleview(start_url):
 
         # Load the page and wait for network to settle
         print("Loading page...")
-        page.goto(start_url, wait_until="networkidle", timeout=30000)
+        page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)  # allow JS to render after DOM load
 
         # Scroll to trigger lazy-loaded content
         print("Scrolling to load all listings...")
@@ -294,23 +450,53 @@ def scrape_simpleview(start_url):
             print(f"Found {len(page_cards)} potential listing cards on page 1")
             all_dom_cards = page_cards
 
+            # Dismiss any popup/modal overlays before paginating
+            for selector in [
+                ".block-popupblock-modal", ".spb_overlay", "[class*='popup']",
+                "[class*='modal']", "[class*='overlay']", ".close", "button[aria-label='Close']",
+            ]:
+                try:
+                    el = page.query_selector(selector)
+                    if el and el.is_visible():
+                        el.click(timeout=2000)
+                        time.sleep(0.5)
+                        break
+                except Exception:
+                    pass
+            # Also try pressing Escape to dismiss modals
+            try:
+                page.keyboard.press("Escape")
+                time.sleep(0.5)
+            except Exception:
+                pass
+
             # Try to paginate via next button
             page_num = 1
-            while True:
+            seen_names = {c["name"] for c in all_dom_cards}
+            max_pages = 50  # safety cap
+            while page_num < max_pages:
                 next_btn = page.query_selector("a[rel='next'], .pager__item--next a, [class*='next'] a, a:has-text('Next'), button:has-text('Next')")
                 if not next_btn:
                     break
                 page_num += 1
                 print(f"  Clicking to page {page_num}...")
-                next_btn.click()
-                page.wait_for_load_state("networkidle", timeout=15000)
-                time.sleep(1)
+                page.evaluate("btn => btn.scrollIntoView({block: 'center'})", next_btn)
+                time.sleep(0.3)
+                page.evaluate("btn => btn.click()", next_btn)
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                time.sleep(2)
                 html = page.content()
                 page_cards, _ = parse_page_cards(html, parsed.netloc)
                 if not page_cards:
                     break
-                print(f"  Found {len(page_cards)} cards on page {page_num}")
-                all_dom_cards.extend(page_cards)
+                # Detect infinite loop — stop if no new names appeared
+                new_cards = [c for c in page_cards if c["name"] not in seen_names]
+                if not new_cards:
+                    print(f"  Page {page_num} has no new listings — stopping")
+                    break
+                seen_names.update(c["name"] for c in new_cards)
+                print(f"  +{len(new_cards)} new cards on page {page_num}")
+                all_dom_cards.extend(new_cards)
 
             print(f"Total DOM cards across all pages: {len(all_dom_cards)}")
 
@@ -439,7 +625,8 @@ def scrape_all_pages(start_url):
 
         page.on("response", handle_response)
         print(f"Loading page 1: {start_url}")
-        page.goto(start_url, wait_until="networkidle", timeout=30000)
+        page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)  # allow JS to render after DOM load
         time.sleep(2)
 
         # Pick the best template URL — prefer one containing "skip", fallback to most items
@@ -581,12 +768,25 @@ if __name__ == "__main__":
     print(f"\nScraping: {url}")
     print("Using Playwright (full JS rendering) — this may take 30-60 seconds\n")
 
-    # Try the paginated version first (better for sites with multiple pages)
-    records = scrape_all_pages(url)
+    # Known Drupal Views AJAX sites — route directly, skip DOM scraper
+    DRUPAL_VIEWS_SITES = ["visitsavannah.com"]
+    is_drupal = any(s in url for s in DRUPAL_VIEWS_SITES)
 
-    if not records:
-        print("Paginated scrape returned nothing — trying single-page scrape...")
-        records = scrape_simpleview(url)
+    if is_drupal:
+        print("Detected Drupal Views AJAX site — using AJAX scraper...")
+        records = scrape_drupal_views(url)
+    else:
+        # Try the paginated API version first (SimpleView etc)
+        records = scrape_all_pages(url)
+
+        if not records:
+            print("Paginated scrape returned nothing — trying single-page DOM scrape...")
+            records = scrape_simpleview(url)
+
+        # Last resort: Drupal Views AJAX
+        if not records:
+            print("Trying Drupal Views AJAX scraper...")
+            records = scrape_drupal_views(url)
 
     if not records:
         print("No records found. The site structure may have changed.")

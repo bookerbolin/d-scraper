@@ -29,6 +29,42 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
+
+
+def resolve_charleston_detail(detail_url):
+    """Fetch a charleston.com/businesses/ detail page and extract address/phone/website."""
+    try:
+        r = requests.get(detail_url, headers=HEADERS, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        for tag in soup.find_all(["nav", "footer", "header"]):
+            tag.decompose()
+        result = {}
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("http") and "charleston.com" not in href and                not any(s in href for s in ["facebook", "instagram", "twitter",
+                                           "yelp", "google", "tripadvisor"]):
+                result["website"] = href
+                break
+        tel = soup.find("a", href=re.compile(r"^tel:"))
+        if tel:
+            result["phone"] = extract_phone(tel["href"])
+        for tag in soup.find_all(["p", "div", "span", "address"]):
+            text = tag.get_text(separator=" ", strip=True)
+            if looks_like_address(text):
+                result["street"] = clean_address(text)
+                break
+            elif len(text) > 30:
+                extracted = extract_address_from_text(text)
+                if extracted:
+                    result["street"] = extracted
+                    break
+        return result
+    except Exception:
+        return {}
+
+
+
 OUTPUT_FIELDS = ["name", "street", "city", "state", "zip", "phone", "website", "description", "source_url"]
 MAX_PAGES = 20
 
@@ -501,6 +537,33 @@ def parse_listings(soup):
         if records:
             return records, "card-link-style"
 
+
+    # Pattern 8: Charleston.com / JBusiness Directory style
+    # <a href="*businesses/*"><h3>name</h3></a> + sibling <p> for location
+    # Detail pages at charleston.com/businesses/slug have full address/phone/website.
+    # Pagination: ?start=20, ?start=40 etc.
+    charleston_links = [a for a in soup.find_all("a", href=re.compile(r"businesses/"))
+                        if a.find("h3") and not a.find_parent("nav")]
+    if charleston_links:
+        for a in charleston_links:
+            h3 = a.find("h3")
+            if not h3:
+                continue
+            name = h3.get_text(strip=True)
+            if not name or len(name) > 100:
+                continue
+            detail_url = a.get("href", "")
+            # Location text in next sibling element
+            loc_el = a.find_next_sibling(["p", "div", "span"])
+            location = loc_el.get_text(strip=True) if loc_el else ""
+            city = location.split(",")[0].strip() if location else ""
+            records.append({
+                "name": name, "street": "", "phone": "", "city": city,
+                "state": "SC", "zip": "", "website": detail_url, "description": "",
+            })
+        if records:
+            return records, "charleston-style"
+
     return [], None
 
 
@@ -511,11 +574,13 @@ def scrape_html(start_url, log=print):
     page = 1
     js_detected = False
     while page <= MAX_PAGES:
-        # Try both common pagination params
+        # Try multiple pagination styles
         if page == 1:
             url = start_url
         elif "discoverdurham.com" in start_url:
             url = f"{start_url}?page={page}&"
+        elif "charleston.com" in start_url:
+            url = f"{start_url}?start={(page-1)*20}"
         else:
             url = f"{start_url}?pg={page}"
         log(f"  Fetching page {page}...")
