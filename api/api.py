@@ -210,7 +210,7 @@ def fetch_soup(url, timeout=15):
 
 def detect_city(url):
     domain = urlparse(url).netloc.lower()
-    for city in ["durham", "chapelhill", "chapel-hill", "hillsborough",
+    for city in ["durham", "chapel-hill", "hillsborough",
                  "raleigh", "asheville", "brevard", "pittsboro"]:
         if city.replace("-", "") in domain.replace("-", ""):
             return city.replace("-", " ").title()
@@ -265,8 +265,8 @@ def scrape_simpleview_api(start_url):
             all_records.append({
                 "name":        item.get("title", item.get("name", "")),
                 "street":      item.get("address1", item.get("address", "")),
-                "city":        item.get("city", city),
-                "state":       item.get("state", "NC"),
+                "city":        item.get("city", ""),
+                "state":       item.get("state", ""),
                 "zip":         item.get("zip", ""),
                 "phone":       item.get("phone", item.get("phoneNumber", "")),
                 "website":     item.get("weburl", item.get("url", item.get("website", ""))),
