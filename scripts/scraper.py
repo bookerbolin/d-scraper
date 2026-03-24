@@ -667,6 +667,142 @@ def parse_listings(soup):
         if records and (substantial or len(records) >= 3):
             return records, "prose-h3-style"
 
+    # Pattern 10: Prose-embedded directory links
+    # Used by visitcharlottesville.org and similar WordPress CVB sites where
+    # listing names appear as inline links within editorial paragraphs.
+    # Structure: <p>...text... <a href="/directory/slug/">Name</a> ...text...</p>
+    # No card structure — names only. Resolution pass fills address/phone/website.
+    DIR_PATTERNS = ["/directory/", "/listing/", "/business/", "/member/", "/place/"]
+    prose_links = []
+    seen_hrefs = set()
+    for a in soup.find_all("a", href=True):
+        href = a.get("href", "")
+        if not any(p in href for p in DIR_PATTERNS):
+            continue
+        if a.find_parent(["nav", "header", "footer"]):
+            continue
+        # Must be inside a paragraph or similar prose container
+        if not a.find_parent(["p", "li", "td", "div"]):
+            continue
+        name = a.get_text(strip=True)
+        if not name or len(name) > 80 or len(name) < 2:
+            continue
+        if href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+        # Make absolute URL
+        full_href = href if href.startswith("http") else ""
+        prose_links.append({"name": name, "street": "", "city": "", "state": "",
+                            "zip": "", "phone": "", "website": full_href,
+                            "description": ""})
+    # Only use this pattern if we found a meaningful number of links
+    # and no other pattern matched (records is still empty at this point)
+    if len(prose_links) >= 5:
+        return prose_links, "prose-directory-links"
+
+
+    # Pattern 11: Structural card inference
+    # Fires when no named pattern matched. Finds repeating block elements
+    # that look like listing cards based on content structure (heading + address/phone/link),
+    # without relying on specific class names.
+    def _infer_cards(soup):
+        PHONE_RE = re.compile(r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}')
+        ADDR_RE  = re.compile(
+            r'\d{1,5}\s+\w[\w\s\.]{2,30}'
+            r'(?:St|Ave|Rd|Dr|Blvd|Ln|Way|Hwy|Pkwy|Ct|Pl|Cir|Street|Avenue|Road|Drive|Boulevard|Lane|Highway|Court|Place)\b',
+            re.I
+        )
+
+        def score(el):
+            txt = el.get_text(" ", strip=True)
+            s = 0
+            if el.find(["h2","h3","h4","h5"]) or el.find(
+                    class_=re.compile(r'title|heading|name', re.I)):
+                s += 1
+            if ADDR_RE.search(txt):
+                s += 1
+            if PHONE_RE.search(txt) or el.find("a", href=re.compile(r'^tel:')):
+                s += 1
+            return s
+
+        from collections import Counter
+        candidates = []
+        for el in soup.find_all(["article","li","div","section"], recursive=True):
+            if el.find_parent(["nav","header","footer"]):
+                continue
+            txt = el.get_text(strip=True)
+            if len(txt) < 20 or len(txt) > 2000:
+                continue
+            if score(el) >= 2:
+                candidates.append(el)
+
+        if not candidates:
+            return []
+
+        def sig(el):
+            return (el.name, tuple(sorted(el.get("class", []))))
+
+        counts = Counter(sig(el) for el in candidates)
+        best_sig, best_count = counts.most_common(1)[0]
+        cards = [el for el in candidates if sig(el) == best_sig] if best_count >= 3 else candidates
+
+        # Remove ancestors of other cards
+        card_ids = set(id(c) for c in cards)
+        cards = [c for c in cards if not any(id(p) in card_ids for p in c.parents)]
+        return cards
+
+    inferred = _infer_cards(soup)
+    if inferred:
+        records = []
+        for card in inferred:
+            name_el = card.find(["h2","h3","h4","h5"]) or card.find(
+                class_=re.compile(r'title|heading|name', re.I))
+            name = name_el.get_text(strip=True) if name_el else ""
+            if not name:
+                for el in card.find_all(["strong","b","p"]):
+                    t = el.get_text(strip=True)
+                    if 2 < len(t) < 80 and not re.search(r'\d{3}.*\d{4}', t):
+                        name = t
+                        break
+            if not name:
+                continue
+
+            text = card.get_text(separator=" ", strip=True)
+
+            # Try full "Street, City, State ZIP" pattern
+            street = city_val = state_val = zip_val = ""
+            full_addr = re.search(
+                r'(\d+[^,]{3,40}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
+                text
+            )
+            if full_addr:
+                street    = full_addr.group(1).strip()
+                city_val  = full_addr.group(2).strip()
+                state_val = full_addr.group(3).strip()
+                zip_val   = full_addr.group(4).strip()
+            else:
+                street = clean_address(extract_address_from_text(text))
+
+            phone_el = card.find("a", href=re.compile(r'^tel:'))
+            phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
+
+            # Prefer outbound link; fall back to any internal detail link
+            link_el = card.find("a", href=re.compile(r'^https?://'))
+            website = link_el["href"] if link_el else ""
+            if not website:
+                # Capture internal detail page link so resolution pass can fetch it
+                internal_link = card.find("a", href=re.compile(r'^/'))
+                if internal_link:
+                    website = internal_link["href"]
+
+            records.append({
+                "name": name, "street": street, "city": city_val,
+                "state": state_val, "zip": zip_val,
+                "phone": phone, "website": website, "description": "",
+            })
+        if records:
+            return records, "inferred-cards"
+
     return [], None
 
 
@@ -676,6 +812,8 @@ def scrape_html(start_url, log=print):
     seen_names = set()
     page = 1
     js_detected = False
+    # Detect WordPress /page/N/ style pagination from first page
+    wp_page_style = False
     while page <= MAX_PAGES:
         # Try multiple pagination styles
         if page == 1:
@@ -686,6 +824,12 @@ def scrape_html(start_url, log=print):
         elif "charleston.com" in start_url:
             sep = "&" if "?" in start_url else "?"
             url = f"{start_url}{sep}start={(page-1)*20}"
+        elif wp_page_style:
+            # WordPress /page/N/ style: insert /page/N/ before query string
+            from urllib.parse import urlparse as _ulp, urlunparse as _uu
+            _p = _ulp(start_url)
+            _path = _p.path.rstrip("/")
+            url = _uu(_p._replace(path=f"{_path}/page/{page}/"))
         else:
             # Build paginated URL by injecting page param, preserving existing query params
             from urllib.parse import urlparse as _ulp, parse_qs as _pqs, urlencode as _ue, urlunparse as _uu
@@ -704,6 +848,13 @@ def scrape_html(start_url, log=print):
         except Exception as e:
             log(f"  Error: {e}")
             break
+        # Detect WordPress /page/N/ style on first page
+        if page == 1:
+            import re as _re
+            _next_links = soup.find_all("a", href=_re.compile(r'/page/\d+/'))
+            if _next_links:
+                wp_page_style = True
+                log("  Detected WordPress /page/N/ pagination")
         listings, pattern = parse_listings(soup)
         if not listings:
             if page == 1:
@@ -717,8 +868,9 @@ def scrape_html(start_url, log=print):
             seen_names.add(name)
             new_count += 1
             all_records.append({
-                "name": name, "street": item.get("street", ""), "city": city,
-                "state": "NC", "zip": "", "website": item.get("website", ""),
+                "name": name, "street": item.get("street", ""), "city": item.get("city", ""),
+                "state": item.get("state", ""), "zip": item.get("zip", ""),
+                "website": item.get("website", ""),
                 "phone": item.get("phone", ""), "description": item.get("description", ""), "source_url": start_url,
             })
         log(f"  Page {page} — {new_count} new listings (pattern: {pattern})")
@@ -817,17 +969,38 @@ def resolve_website(record, source_domain):
                 record["website"] = href
                 return record
 
+        # Extract description if not already set
+        if not record.get("description"):
+            for tag in soup.find_all(["p", "div"], class_=lambda c: c and any(
+                    x in " ".join(c).lower() for x in ["desc", "about", "summary", "bio", "content", "text"]
+                    ) if c else False):
+                txt = tag.get_text(strip=True)
+                if len(txt) > 30 and len(txt) < 500:
+                    record["description"] = txt[:300]
+                    break
+            # Fallback: first substantial paragraph on page
+            if not record.get("description"):
+                for p in soup.find_all("p"):
+                    txt = p.get_text(strip=True)
+                    if len(txt) > 50 and len(txt) < 500:
+                        record["description"] = txt[:300]
+                        break
+
     except Exception as e:
         record["_resolve_error"] = str(e)[:80]
     return record
 
 
 def resolve_all(records, source_domain, log=print):
+    # Resolve if: website is internal OR record is missing street/phone and has any website
     internal = [i for i, r in enumerate(records)
-                if r.get("website") and urlparse(r["website"]).netloc in ("", source_domain)]
+                if r.get("website") and (
+                    urlparse(r["website"]).netloc in ("", source_domain)
+                    or (not r.get("street") and not r.get("phone"))
+                )]
     if not internal:
         return records
-    log(f"  Resolving {len(internal)} internal URLs...")
+    log(f"  Resolving {len(internal)} detail pages...")
     with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(resolve_website, records[i], source_domain): i for i in internal}
         done = 0
@@ -895,6 +1068,41 @@ def main():
     if not records:
         print("\n❌ No records extracted.")
         sys.exit(1)
+
+    # State backfill — infer from source domain if all records are missing state
+    DOMAIN_STATE = {
+        "annarbor.org": "MI", "visitannarbor.org": "MI",
+        "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
+        "visitathensga.com": "GA", "exploregeorgia.org": "GA",
+        "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
+        "visitchapelhill.org": "NC", "visitraleigh.com": "NC",
+        "discoverdurham.com": "NC", "downtowndurham.com": "NC",
+        "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
+        "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
+        "discoverburkecounty.com": "NC",
+        "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
+        "charleston.com": "SC",
+        "bouldercoloradousa.com": "CO",
+        "visitithaca.com": "NY",
+        "thinkiowacity.com": "IA",
+        "helloburlingtonvt.com": "VT",
+        "austintexas.org": "TX",
+        "visitcharlottesville.org": "VA",
+    }
+    source_netloc = urlparse(url).netloc.replace("www.", "")
+    inferred_state = DOMAIN_STATE.get(source_netloc, "")
+    if inferred_state:
+        missing_state = sum(1 for r in records if not r.get("state"))
+        if missing_state == len(records):
+            for r in records:
+                r["state"] = inferred_state
+            print(f"  State backfilled: {inferred_state} ({missing_state} records)")
+        elif missing_state > 0:
+            for r in records:
+                if not r.get("state"):
+                    r["state"] = inferred_state
+            print(f"  State backfilled for {missing_state} blank records: {inferred_state}")
+
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()

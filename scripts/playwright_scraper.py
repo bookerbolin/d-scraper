@@ -459,38 +459,128 @@ def scrape_simpleview(start_url):
 
             from bs4 import BeautifulSoup
 
+            def infer_cards(soup):
+                """
+                Infer listing cards by structure, not class name.
+                A listing card is a repeated sibling element that contains
+                at least a name-like heading AND one of: address, phone, or outbound link.
+                We find the most common repeating container that meets these criteria.
+                """
+                import re as _re
+                from collections import Counter
+
+                PHONE_RE = _re.compile(r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}')
+                ADDR_RE  = _re.compile(r'\d{1,5}\s+\w[\w\s\.]{2,30}'
+                                       r'(?:St|Ave|Rd|Dr|Blvd|Ln|Way|Hwy|Pkwy|Ct|Pl|Cir|Street|Avenue|Road|Drive|Boulevard|Lane|Highway|Court|Place)\b',
+                                       _re.I)
+
+                def card_score(el):
+                    """Score how much an element looks like a listing card (0-3)."""
+                    txt = el.get_text(" ", strip=True)
+                    score = 0
+                    # Has a heading-like child
+                    if el.find(["h2","h3","h4","h5"]) or el.find(
+                            class_=_re.compile(r'title|heading|name', _re.I)):
+                        score += 1
+                    # Has address
+                    if ADDR_RE.search(txt):
+                        score += 1
+                    # Has phone or outbound link
+                    if PHONE_RE.search(txt) or el.find("a", href=_re.compile(r'^tel:')):
+                        score += 1
+                    return score
+
+                # Collect all block-level elements that could be cards
+                candidates = soup.find_all(
+                    ["article", "li", "div", "section"],
+                    recursive=True
+                )
+
+                # Filter: must have score >= 2, not be nav/header/footer, reasonable text length
+                good = []
+                for el in candidates:
+                    if el.find_parent(["nav","header","footer"]):
+                        continue
+                    txt = el.get_text(strip=True)
+                    if len(txt) < 20 or len(txt) > 2000:
+                        continue
+                    if card_score(el) >= 2:
+                        good.append(el)
+
+                if not good:
+                    return []
+
+                # Among good candidates, prefer the most repeated tag+class combo
+                # (the repeating unit is the actual card, not its container)
+                def sig(el):
+                    cls = tuple(sorted(el.get("class", [])))
+                    return (el.name, cls)
+
+                counts = Counter(sig(el) for el in good)
+                best_sig, best_count = counts.most_common(1)[0]
+
+                # If the best signature appears >= 3 times, use it
+                # Otherwise fall back to all good candidates
+                if best_count >= 3:
+                    cards = [el for el in good if sig(el) == best_sig]
+                else:
+                    cards = good
+
+                # Deduplicate — remove any card that is an ancestor of another card
+                card_set = set(id(c) for c in cards)
+                cards = [c for c in cards
+                         if not any(id(p) in card_set
+                                    for p in c.parents)]
+                return cards
+
             def parse_page_cards(html, parsed_netloc):
                 soup = BeautifulSoup(html, "lxml")
-                cards = (
-                    soup.select(".sv-listing-card") or
-                    soup.select(".listing-card") or
-                    soup.select("[class*='listing']") or
-                    soup.select("article")
-                )
+                cards = infer_cards(soup)
                 results = []
                 for card in cards:
-                    name_el = card.select_one("h2, h3, .listing-title, [class*='title']")
+                    # Name: first heading or title-like element in the card
+                    import re as _re
+                    name_el = card.find(["h2","h3","h4","h5"]) or card.find(
+                        class_=_re.compile(r'title|heading|name', _re.I))
                     name = name_el.get_text(strip=True) if name_el else ""
+                    # Fallback: first short bold/strong text
+                    if not name:
+                        for el in card.find_all(["strong","b","p"]):
+                            t = el.get_text(strip=True)
+                            if 2 < len(t) < 80 and not _re.search(r'\d{3}.*\d{4}', t):
+                                name = t
+                                break
                     if not name:
                         continue
 
                     text = card.get_text(separator=" ", strip=True)
-                    street = clean_address(extract_address_from_text(text))
 
-                    # Capture city-only locations (e.g. "Savannah", "St. Simons Island")
-                    # when no street address found
-                    card_city = ""
-                    if not street:
-                        import re as _re
-                        # Look for short text lines that look like city names
-                        # (no digits, not a category tag, 2-5 words)
+                    # Try full "Street, City, State ZIP" pattern first (e.g. Charlottesville cards)
+                    import re as _re
+                    street = city_val = state_val = zip_val = ""
+                    full_addr = _re.search(
+                        r'(\d+[^,]{3,40}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
+                        text
+                    )
+                    if full_addr:
+                        street   = full_addr.group(1).strip()
+                        city_val = full_addr.group(2).strip()
+                        state_val = normalize_state(full_addr.group(3).strip())
+                        zip_val  = full_addr.group(4).strip()
+                    else:
+                        street = clean_address(extract_address_from_text(text))
+
+                    # Capture city-only locations when no street found
+                    card_city = city_val
+                    if not street and not card_city:
                         for line in text.split("  "):
                             line = line.strip()
                             if (line and not _re.search(r'\d', line)
                                     and 2 <= len(line.split()) <= 5
                                     and len(line) < 40
                                     and line.lower() not in ["visit website", "day spas",
-                                        "hotels & motels", "spas", "wellness", "resort"]):
+                                        "hotels & motels", "spas", "wellness", "resort",
+                                        "learn more", "website"]):
                                 card_city = line
                                 break
 
@@ -501,7 +591,9 @@ def scrape_simpleview(start_url):
                     phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
 
                     results.append({
-                        "name": name, "street": street, "card_city": card_city,
+                        "name": name, "street": street, "city": city_val,
+                        "state": state_val, "zip": zip_val,
+                        "card_city": card_city,
                         "website": website, "phone": phone,
                     })
                 return results, soup
@@ -565,13 +657,15 @@ def scrape_simpleview(start_url):
             for card_data in all_dom_cards:
                 name = card_data["name"]
                 street = card_data["street"]
-                card_city = card_data.get("card_city", "") or city
+                card_city  = card_data.get("city", "") or card_data.get("card_city", "") or city
+                card_state = card_data.get("state", "")
+                card_zip   = card_data.get("zip", "")
                 phone = card_data.get("phone", "")
                 website = card_data.get("website", "")
 
                 all_records.append({
                     "name": name, "street": street,
-                    "city": card_city, "state": "", "zip": "",
+                    "city": card_city, "state": card_state, "zip": card_zip,
                     "phone": phone, "website": website,
                     "description": "", "source_url": start_url,
                 })
@@ -1101,6 +1195,56 @@ if __name__ == "__main__":
                     print(f"  Resolved {done}/{len(missing_addr)}...")
         filled = sum(1 for i in missing_addr if records[i].get("street"))
         print(f"  Resolution complete — filled {filled}/{len(missing_addr)} missing addresses.")
+
+    # ── State backfill ───────────────────────────────────────────────────────
+    # If state is blank on every record, infer it from the source domain.
+    # This handles SimpleView CVB sites where state never appears in the API response.
+    # We don't guess zip — multiple cities in a region means multiple zips.
+    DOMAIN_STATE = {
+        # Michigan
+        "annarbor.org": "MI", "visitannarbor.org": "MI",
+        # Wisconsin
+        "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
+        # Georgia
+        "visitathensga.com": "GA", "exploregeorgia.org": "GA",
+        "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
+        # North Carolina
+        "visitchapelhill.org": "NC", "visitraleigh.com": "NC",
+        "discoverdurham.com": "NC", "downtowndurham.com": "NC",
+        "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
+        "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
+        "discoverburkecounty.com": "NC",
+        # South Carolina
+        "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
+        "charleston.com": "SC",
+        # Colorado
+        "bouldercoloradousa.com": "CO",
+        # New York
+        "visitithaca.com": "NY",
+        # Iowa
+        "thinkiowacity.com": "IA",
+        # Vermont
+        "helloburlingtonvt.com": "VT",
+        # Texas
+        "austintexas.org": "TX",
+        # Virginia
+        "visitcharlottesville.org": "VA",
+    }
+    source_netloc = urlparse(url).netloc.replace("www.", "")
+    inferred_state = DOMAIN_STATE.get(source_netloc, "")
+    if inferred_state:
+        missing_state = sum(1 for r in records if not r.get("state"))
+        if missing_state == len(records):
+            # All blank — backfill confidently
+            for r in records:
+                r["state"] = inferred_state
+            print(f"  State backfilled: {inferred_state} ({missing_state} records)")
+        elif missing_state > 0:
+            # Partial — only fill blanks
+            for r in records:
+                if not r.get("state"):
+                    r["state"] = inferred_state
+            print(f"  State backfilled for {missing_state} blank records: {inferred_state}")
 
     # Save output — filename includes domain + path slug + capture date
     parsed = urlparse(url)
