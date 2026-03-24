@@ -954,13 +954,22 @@ def scrape_all_pages(start_url):
     print(f"\nTotal items collected: {len(all_items)}")
 
     # Convert to records
+    _sv_base = f"{urlparse(start_url).scheme}://{urlparse(start_url).netloc}"
     records = []
     for item in all_items:
         if not isinstance(item, dict):
             continue
         addr = item.get("address1", item.get("address", ""))
+        name = item.get("title", item.get("name", ""))
+        # Construct SimpleView detail URL from recid + name slug
+        # Pattern: /listing/name-slug/recid/
+        recid = item.get("recid", item.get("id", ""))
+        detail_url = ""
+        if recid and name:
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+            detail_url = f"{_sv_base}/listing/{slug}/{recid}/"
         records.append({
-            "name":        item.get("title", item.get("name", "")),
+            "name":        name,
             "street":      addr,
             "city":        item.get("city", ""),
             "state":       item.get("state", ""),
@@ -969,6 +978,7 @@ def scrape_all_pages(start_url):
             "website":     item.get("weburl", item.get("url", item.get("website", ""))),
             "description": item.get("description", item.get("teaser", "")),
             "source_url":  start_url,
+            "_detail_url": detail_url,
         })
 
     return records
@@ -1228,7 +1238,9 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
 
         for n, i in enumerate(needs_resolve, 1):
             record = rows[i]
-            detail_url = record.get(detail_url_field, "")
+            # Prefer _detail_url (CVB detail page) over website (external business site)
+            # Phone/description live on the CVB page, not the business website
+            detail_url = record.get("_detail_url", "") or record.get(detail_url_field, "")
             if not detail_url:
                 continue
 
@@ -1353,44 +1365,77 @@ if __name__ == "__main__":
                     )]
     if missing_addr:
         print(f"\nResolution pass — {len(missing_addr)} records missing phone/address/description...")
-        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def resolve_detail(record):
-            detail_url = record.get("website", "")
-            if not detail_url:
+        # Detect if detail pages are JS-rendered by probing the first one with plain HTTP
+        import requests as _rq2
+        _probe_url = (records[missing_addr[0]].get("_detail_url", "")
+                      or records[missing_addr[0]].get("website", ""))
+        _js_rendered = False
+        if _probe_url:
+            try:
+                _probe = _rq2.get(_probe_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+                _soup_probe = BeautifulSoup(_probe.text, "lxml")
+                # JS-rendered if page has almost no text after stripping boilerplate
+                _probe_text = _soup_probe.get_text(strip=True)
+                _js_rendered = len(_probe_text) < 500 or "browser is not supported" in _probe_text
+            except Exception:
+                pass
+
+        if _js_rendered:
+            print(f"  Detail pages are JS-rendered — using Playwright for resolution...")
+            # Reuse the already-open Playwright context if available, else note it
+            # Write CSV to temp file and call resolve_csv_with_playwright inline
+            import tempfile, os as _os2
+            _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False,
+                                               newline="", encoding="utf-8")
+            _writer = csv.DictWriter(_tmp, fieldnames=OUTPUT_FIELDS)
+            _writer.writeheader()
+            _writer.writerows(records)
+            _tmp.close()
+            resolve_csv_with_playwright(_tmp.name)
+            with open(_tmp.name, newline="", encoding="utf-8") as _f2:
+                _resolved = list(csv.DictReader(_f2))
+            _os2.unlink(_tmp.name)
+            # Merge resolved data back into records
+            for i, r in enumerate(_resolved):
+                if i < len(records):
+                    for field in ("phone", "description", "street", "city", "state", "zip", "website"):
+                        if r.get(field) and not records[i].get(field):
+                            records[i][field] = r[field]
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def resolve_detail(record):
+                detail_url = record.get("website", "")
+                if not detail_url:
+                    return record
+                details = resolve_detail_page(detail_url)
+                for field in ("street", "city", "state", "zip", "phone"):
+                    if details.get(field) and not record.get(field):
+                        record[field] = details[field]
+                if not record.get("website") and details.get("website"):
+                    record["website"] = details["website"]
+                if not record.get("description") and details.get("description"):
+                    record["description"] = details["description"]
                 return record
-            # Plain HTTP — works for static detail pages
-            # JS-rendered detail pages (e.g. SimpleView) need: scrape-resolve <csv>
-            details = resolve_detail_page(detail_url)
-            for field in ("street", "city", "state", "zip", "phone"):
-                if details.get(field) and not record.get(field):
-                    record[field] = details[field]
-            if not record.get("website") and details.get("website"):
-                record["website"] = details["website"]
-            if not record.get("description") and details.get("description"):
-                record["description"] = details["description"]
-            return record
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(resolve_detail, records[i]): i for i in missing_addr}
-            done = 0
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    records[idx] = future.result(timeout=15)
-                except Exception:
-                    pass
-                done += 1
-                if done % 10 == 0:
-                    print(f"  Resolved {done}/{len(missing_addr)}...")
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(resolve_detail, records[i]): i for i in missing_addr}
+                done = 0
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        records[idx] = future.result(timeout=15)
+                    except Exception:
+                        pass
+                    done += 1
+                    if done % 10 == 0:
+                        print(f"  Resolved {done}/{len(missing_addr)}...")
+
         filled_street = sum(1 for i in missing_addr if records[i].get("street"))
         filled_phone  = sum(1 for i in missing_addr if records[i].get("phone"))
         filled_desc   = sum(1 for i in missing_addr if records[i].get("description"))
         print(f"  Resolution complete — address: +{filled_street}  phone: +{filled_phone}  description: +{filled_desc}")
-        remaining = sum(1 for r in records if not r.get("phone") or not r.get("description"))
-        if remaining:
-            print(f"  {remaining} records still missing phone/description")
-            print(f"  Tip: if detail pages are JS-rendered, run: scrape-resolve <csv_path>")
 
     # ── State backfill ───────────────────────────────────────────────────────
     # If state is blank on every record, infer it from the source domain.

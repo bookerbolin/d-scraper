@@ -879,12 +879,22 @@ def scrape_html(start_url, log=print):
                 continue
             seen_names.add(name)
             new_count += 1
-            all_records.append({
+            _website = item.get("website", "")
+            _detail = item.get("_detail_url", "")
+            # If website is same-domain, it IS the detail URL — promote it
+            if _website and not _detail:
+                _parsed_w = urlparse(_website)
+                if not _parsed_w.netloc or _parsed_w.netloc == source_domain:
+                    _detail = _website if _website.startswith("http") else f"https://{source_domain}{_website}"
+            _rec = {
                 "name": name, "street": item.get("street", ""), "city": item.get("city", ""),
                 "state": item.get("state", ""), "zip": item.get("zip", ""),
-                "website": item.get("website", ""),
+                "website": _website,
                 "phone": item.get("phone", ""), "description": item.get("description", ""), "source_url": start_url,
-            })
+            }
+            if _detail:
+                _rec["_detail_url"] = _detail
+            all_records.append(_rec)
         log(f"  Page {page} — {new_count} new listings (pattern: {pattern})")
         if new_count == 0:
             break
@@ -894,20 +904,26 @@ def scrape_html(start_url, log=print):
 
 
 def resolve_website(record, source_domain):
+    # Always prefer _detail_url for fetching — it's the CVB detail page
+    # which has phone/description, unlike the external business website
+    detail_url = record.get("_detail_url", "")
     website = record.get("website", "")
-    if not website:
+    fetch_url = detail_url or website
+    if not fetch_url:
         return record
-    parsed = urlparse(website)
-    # Skip if website is external AND we already have phone+description
-    if parsed.netloc and parsed.netloc != source_domain:
+    # Skip entirely if we already have everything we need
+    if record.get("phone") and record.get("description") and record.get("street"):
+        return record
+    parsed = urlparse(fetch_url)
+    # If fetching external site with no detail URL, skip — nothing to gain
+    if not detail_url and parsed.netloc and parsed.netloc != source_domain:
         if record.get("phone") and record.get("description"):
             return record
-        # Still need to fetch the detail page — but use source domain URL if we have one
-        # The external website won't have the CVB detail data; look for a stored detail URL
-        detail_url = record.get("_detail_url", "")
-        if not detail_url:
-            return record  # no detail page to fetch
-        website = detail_url
+        if not record.get("street"):
+            pass  # still try for address
+        else:
+            return record
+    website = fetch_url
     SKIP = [source_domain, "facebook.com", "instagram.com", "twitter.com",
             "yelp.com", "google.com", "tripadvisor.com",
             "linkedin.com", "tiktok.com", "youtube.com", "pinterest.com"]
@@ -1017,11 +1033,15 @@ def resolve_website(record, source_domain):
 
 
 def resolve_all(records, source_domain, log=print):
-    # Resolve if: website is internal OR record is missing street/phone and has any website
+    # Resolve if:
+    # - website is internal (same domain as source)
+    # - _detail_url is set and phone or description missing
+    # - street and phone both missing (need full detail fetch)
     internal = [i for i, r in enumerate(records)
-                if r.get("website") and (
-                    urlparse(r["website"]).netloc in ("", source_domain)
-                    or (not r.get("street") and not r.get("phone"))
+                if (
+                    (r.get("website") and urlparse(r["website"]).netloc in ("", source_domain))
+                    or (r.get("_detail_url") and (not r.get("phone") or not r.get("description")))
+                    or (r.get("website") and not r.get("street") and not r.get("phone"))
                 )]
     if not internal:
         return records
