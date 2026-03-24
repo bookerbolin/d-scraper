@@ -1081,6 +1081,7 @@ def resolve_all(records, source_domain, log=print):
         log(f"  Note: {still_internal} URLs still point to {source_domain} (no outbound link on detail page)")
     for r in records:
         r.pop("_resolve_error", None)
+        r.pop("_detail_url", None)
     return records
 
 

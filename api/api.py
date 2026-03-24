@@ -1098,6 +1098,9 @@ def resolve_all(records, source_domain):
                 records[idx] = future.result(timeout=10)
             except Exception:
                 pass
+    for r in records:
+        r.pop("_resolve_error", None)
+        r.pop("_detail_url", None)
     return records
 
 

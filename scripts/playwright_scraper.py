@@ -1499,6 +1499,11 @@ if __name__ == "__main__":
     _os.makedirs(data_dir, exist_ok=True)
     output_file = _os.path.join(data_dir, f"{domain}_{path_slug}_{datestamp}.csv")
 
+    # Strip private/internal fields before writing
+    _private = {"_detail_url", "_resolve_error"}
+    for r in records:
+        for k in _private:
+            r.pop(k, None)
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()
