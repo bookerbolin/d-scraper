@@ -835,18 +835,32 @@ def parse_listings(soup):
             phone_el = card.find("a", href=re.compile(r'^tel:'))
             phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
 
-            link_el = card.find("a", href=re.compile(r'^https?://'))
-            website = link_el["href"] if link_el else ""
-            if not website:
-                internal_link = card.find("a", href=re.compile(r'^\/'))
-                if internal_link:
-                    website = internal_link["href"]
+            # Capture any link — outbound preferred, same-domain detail link accepted
+            website = ""
+            detail_url = ""
+            for _a in card.find_all("a", href=True):
+                _href = _a["href"]
+                _netloc = urlparse(_href).netloc
+                _is_ext = (_netloc and _netloc != source_domain
+                           and not any(s in _netloc for s in
+                                       ["facebook","instagram","twitter","google","yelp"]))
+                _is_int = (not _netloc or _netloc == source_domain)
+                if _is_ext:
+                    website = _href
+                    break
+                elif _is_int and _href not in ("/", "#", "") and not detail_url:
+                    detail_url = _href if _href.startswith("http") else f"https://{source_domain}{_href}"
+                    if not website:
+                        website = detail_url
 
-            records.append({
+            rec = {
                 "name": name, "street": street, "city": city_val,
                 "state": state_val, "zip": zip_val,
                 "phone": phone, "website": website, "description": "",
-            })
+            }
+            if detail_url and detail_url != website:
+                rec["_detail_url"] = detail_url
+            records.append(rec)
         if records:
             return records, "inferred-cards"
 
@@ -930,8 +944,16 @@ def resolve_website(record, source_domain):
     if not website:
         return record
     parsed = urlparse(website)
+    # Skip if website is external AND we already have phone+description
     if parsed.netloc and parsed.netloc != source_domain:
-        return record
+        if record.get("phone") and record.get("description"):
+            return record
+        # Still need to fetch the detail page — but use source domain URL if we have one
+        # The external website won't have the CVB detail data; look for a stored detail URL
+        detail_url = record.get("_detail_url", "")
+        if not detail_url:
+            return record  # no detail page to fetch
+        website = detail_url
     SKIP = [source_domain, "facebook.com", "instagram.com", "twitter.com",
             "yelp.com", "google.com", "tripadvisor.com",
             "linkedin.com", "tiktok.com", "youtube.com", "pinterest.com"]
@@ -940,7 +962,7 @@ def resolve_website(record, source_domain):
               "m.facebook.com"]
     try:
         full_url = website if website.startswith("http") else f"https://{source_domain}{website}"
-        r = requests.get(full_url, headers=HEADERS, timeout=10)
+        r = requests.get(full_url, headers=HEADERS, timeout=20)
         soup = BeautifulSoup(r.text, "lxml")
         for tag in soup.find_all(["nav", "footer", "header"]):
             tag.decompose()
@@ -981,34 +1003,39 @@ def resolve_website(record, source_domain):
                         record["street"] = extracted
                         break
 
-        # First pass: prefer labelled outbound links (real website)
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            href_domain = urlparse(href).netloc
-            if not href_domain or any(s in href_domain for s in SKIP):
-                continue
-            label = a.get_text(strip=True).lower()
-            if any(w in label for w in ["website", "visit", "www", "menu", "order", "book"]):
-                record["website"] = href
-                return record
-
-        # Second pass: first clean outbound non-social link
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            href_domain = urlparse(href).netloc
-            if not href_domain or any(s in href_domain for s in SKIP):
-                continue
-            if href.startswith("http"):
-                record["website"] = href
-                return record
-
-        # Third pass: accept social link as website if nothing else found
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            href_domain = urlparse(href).netloc
-            if href.startswith("http") and any(s in href_domain for s in SOCIAL):
-                record["website"] = href
-                return record
+        # Find best outbound website link — labelled first, then any clean link, then social
+        if not record.get("website") or urlparse(record.get("website","")).netloc == source_domain:
+            found_website = ""
+            # First pass: labelled link
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                href_domain = urlparse(href).netloc
+                if not href_domain or any(s in href_domain for s in SKIP):
+                    continue
+                label = a.get_text(strip=True).lower()
+                if any(w in label for w in ["website", "visit", "www", "menu", "order", "book"]):
+                    found_website = href
+                    break
+            # Second pass: any clean outbound link
+            if not found_website:
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    href_domain = urlparse(href).netloc
+                    if not href_domain or any(s in href_domain for s in SKIP):
+                        continue
+                    if href.startswith("http"):
+                        found_website = href
+                        break
+            # Third pass: social link fallback
+            if not found_website:
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    href_domain = urlparse(href).netloc
+                    if href.startswith("http") and any(s in href_domain for s in SOCIAL):
+                        found_website = href
+                        break
+            if found_website:
+                record["website"] = found_website
 
         # Extract description if not already set
         if not record.get("description"):
@@ -1026,8 +1053,8 @@ def resolve_website(record, source_domain):
                         record["description"] = txt[:300]
                         break
 
-    except Exception:
-        pass
+    except Exception as e:
+        record["_resolve_error"] = str(e)[:120]
     return record
 
 
@@ -1058,12 +1085,33 @@ def resolve_all(records, source_domain):
 
 
 def run_scrape(url):
+    import re as _re3
+
+    def _name_to_slug(name):
+        s = name.lower()
+        s = _re3.sub(r"[\u2018\u2019\u0027\u0060]", "", s)
+        s = _re3.sub(r"[^a-z0-9]+", "-", s)
+        return s.strip("-")
+
+    DETAIL_URL_BUILDERS = {
+        "thinkiowacity.com": lambda name, base: f"https://thinkiowacity.com/listing/{_name_to_slug(name)}/",
+    }
+
     if is_simpleview(url):
         records = scrape_simpleview_api(url)
         return records, False, "SimpleView CMS — used direct API (may be incomplete; use Playwright locally for full results)"
     records, js_detected = scrape_html(url)
     if js_detected:
         return [], True, "JavaScript-rendered page — no listings found in raw HTML"
+
+    # Construct detail URLs for sites where they're derivable from name
+    _source_netloc = urlparse(url).netloc.replace("www.", "")
+    _builder = DETAIL_URL_BUILDERS.get(_source_netloc)
+    if _builder:
+        for r in records:
+            if not r.get("website") and r.get("name"):
+                r["website"] = _builder(r["name"], url)
+
     records = resolve_all(records, urlparse(url).netloc)
     return records, False, ""
 

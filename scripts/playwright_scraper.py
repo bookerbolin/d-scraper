@@ -584,8 +584,20 @@ def scrape_simpleview(start_url):
                                 card_city = line
                                 break
 
-                    link = card.select_one("a[href^='http']:not([href*='" + parsed_netloc + "'])")
-                    website = link["href"] if link else ""
+                    # Prefer external link; fall back to same-domain detail link
+                    website = ""
+                    for _a in card.find_all("a", href=True):
+                        _href = _a["href"]
+                        _nl = urlparse(_href).netloc
+                        _ext = (_nl and _nl != parsed_netloc
+                                and not any(s in _nl for s in
+                                            ["facebook","instagram","twitter","google","yelp"]))
+                        _int = (not _nl or _nl == parsed_netloc)
+                        if _ext:
+                            website = _href
+                            break
+                        elif _int and _href not in ("/", "#", "") and not website:
+                            website = _href
 
                     phone_el = card.select_one("a[href^='tel:']")
                     phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
@@ -1111,7 +1123,184 @@ def scrape_algolia(url):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _extract_best_description(soup, record=None):
+    """
+    Extract the best business description from a detail page without relying
+    on specific label words. Scores all text blocks and returns the one that
+    looks most like a business description.
+    """
+    import re as _re2
+
+    LABEL_WORDS = _re2.compile(
+        r"\b(about|description|overview|details|info|information|story|"
+        r"summary|profile|who we are|our story|mission)\b", _re2.I
+    )
+    NOISE_START = _re2.compile(
+        r"^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|"
+        r"address|directions|map|parking|admission|price|cost|\$|\u00a9|privacy|"
+        r"terms|cookie|follow us|share|tweet|like|subscribe|sign up|newsletter|"
+        r"powered by|all rights reserved)", _re2.I
+    )
+    DATA_HEAVY = _re2.compile(r"(\d{5}|\(\d{3}\)|\d{1,2}:\d{2}\s*(am|pm))", _re2.I)
+
+    name = (record or {}).get("name", "")
+
+    def score_block(txt):
+        if len(txt) < 60 or len(txt) > 800:
+            return 0
+        if NOISE_START.match(txt):
+            return 0
+        if DATA_HEAVY.search(txt[:40]):
+            return 0
+        s = 0
+        if txt[0].isupper():
+            s += 1
+        if _re2.search(r"[.!?]\s", txt) or txt[-1] in ".!?":
+            s += 1
+        if " " in txt[10:40]:
+            s += 1
+        if 80 < len(txt) < 500:
+            s += 2
+        if name and txt.strip().lower() == name.strip().lower():
+            return 0
+        return s
+
+    candidates = []
+    for tag in soup.find_all(["p", "dd", "div", "span", "li", "section"]):
+        if tag.find(["p", "dd", "div", "section"]):
+            continue
+        txt = _re2.sub(r"\s+", " ", tag.get_text(separator=" ", strip=True)).strip()
+        s = score_block(txt)
+        if s > 0:
+            prev = tag.find_previous(["h2","h3","h4","button","dt","strong","b"])
+            if prev and LABEL_WORDS.search(prev.get_text(strip=True)):
+                s += 3
+            if tag.find_parent(class_=_re2.compile(r"active|open|expanded", _re2.I)):
+                s += 2
+            candidates.append((s, txt))
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+    return candidates[0][1][:400]
+
+def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_domain=None,
+                                phone_selector="a[href^='tel:']",
+                                about_heading=re.compile(r'^about', re.I)):
+    """
+    Re-open a CSV and fill in missing phone/description by fetching each
+    detail page with Playwright (handles JS-rendered detail pages like SimpleView).
+
+    Usage:
+        python playwright_scraper.py --resolve path/to/file.csv
+
+    Reads: csv_path
+    Writes: csv_path (in-place, overwrites)
+    Only fetches pages where phone OR description is missing.
+    """
+    import os as _os
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+        fieldnames = list(rows[0].keys()) if rows else OUTPUT_FIELDS
+
+    needs_resolve = [i for i, r in enumerate(rows)
+                     if r.get(detail_url_field)
+                     and (not r.get("phone") or not r.get("description"))]
+
+    if not needs_resolve:
+        print(f"Nothing to resolve — all {len(rows)} records have phone and description.")
+        return
+
+    print(f"Resolving {len(needs_resolve)} records via Playwright...")
+    print(f"(Fetching JS-rendered detail pages for phone + description)\n")
+
+    filled_phone = 0
+    filled_desc  = 0
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ))
+        page = context.new_page()
+
+        for n, i in enumerate(needs_resolve, 1):
+            record = rows[i]
+            detail_url = record.get(detail_url_field, "")
+            if not detail_url:
+                continue
+
+            try:
+                page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+                time.sleep(1.5)
+
+                html = page.content()
+                from bs4 import BeautifulSoup as _BS
+                soup = _BS(html, "lxml")
+                for tag in soup(["nav", "header", "footer"]):
+                    tag.decompose()
+
+                # Phone
+                if not record.get("phone"):
+                    tel = soup.find("a", href=re.compile(r'^tel:'))
+                    if tel:
+                        phone = extract_phone(tel["href"])
+                        if phone:
+                            record["phone"] = phone
+                            filled_phone += 1
+
+                # Description — find best prose block on the page
+                # Rather than hunting for a specific label, score all text blocks
+                # and pick the one that looks most like a business description.
+                if not record.get("description"):
+                    desc = _extract_best_description(soup, record)
+                    if desc:
+                        record["description"] = desc
+                        filled_desc += 1
+
+            except Exception as e:
+                pass  # silently skip failures
+
+            if n % 10 == 0 or n == len(needs_resolve):
+                print(f"  {n}/{len(needs_resolve)} — phone: +{filled_phone}  desc: +{filled_desc}")
+
+        browser.close()
+
+    # Boilerplate dedup
+    from collections import Counter as _Counter
+    desc_counts = _Counter(r.get("description","")[:120] for r in rows if r.get("description"))
+    boilerplate = {d for d, n in desc_counts.items() if n >= 3}
+    if boilerplate:
+        cleared = sum(1 for r in rows if r.get("description","")[:120] in boilerplate)
+        for r in rows:
+            if r.get("description","")[:120] in boilerplate:
+                r["description"] = ""
+        print(f"  Cleared {cleared} boilerplate descriptions")
+
+    # Write back
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\n✅ Done — wrote {len(rows)} records back to {csv_path}")
+    print(f"   Phone filled:       {filled_phone}")
+    print(f"   Description filled: {filled_desc}")
+    print(f"   With phone now:     {sum(1 for r in rows if r.get('phone'))}")
+    print(f"   With description:   {sum(1 for r in rows if r.get('description'))}")
+
+
 if __name__ == "__main__":
+    # --resolve mode: fill in phone/description from JS-rendered detail pages
+    if len(sys.argv) > 1 and sys.argv[1] == "--resolve":
+        if len(sys.argv) < 3:
+            print("Usage: playwright_scraper.py --resolve path/to/file.csv")
+            sys.exit(1)
+        resolve_csv_with_playwright(sys.argv[2])
+        sys.exit(0)
+
     url = sys.argv[1] if len(sys.argv) > 1 else input("Enter URL to scrape: ").strip()
 
     print(f"\nScraping: {url}")
@@ -1155,30 +1344,31 @@ if __name__ == "__main__":
         print("No records found. The site structure may have changed.")
         sys.exit(1)
 
-    # Generic resolution pass — runs whenever records are missing street addresses
-    # Uses exploregeorgia-specific resolver for that site, generic scraper.py resolver for others
-    missing_addr = [i for i, r in enumerate(records) if not r.get("street") and r.get("website")]
+    # Generic resolution pass — runs whenever records are missing street, phone, or description
+    missing_addr = [i for i, r in enumerate(records)
+                    if r.get("website") and (
+                        not r.get("street")
+                        or not r.get("phone")
+                        or not r.get("description")
+                    )]
     if missing_addr:
-        print(f"\nResolution pass — {len(missing_addr)} records missing address, fetching detail pages...")
+        print(f"\nResolution pass — {len(missing_addr)} records missing phone/address/description...")
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        import requests as _req
-        from bs4 import BeautifulSoup as _BS
-
-        source_domain = urlparse(url).netloc
 
         def resolve_detail(record):
             detail_url = record.get("website", "")
             if not detail_url:
                 return record
-
-            # Use site-specific resolver if available
-            # Use the generic detail page resolver for all sites
+            # Plain HTTP — works for static detail pages
+            # JS-rendered detail pages (e.g. SimpleView) need: scrape-resolve <csv>
             details = resolve_detail_page(detail_url)
             for field in ("street", "city", "state", "zip", "phone"):
                 if details.get(field) and not record.get(field):
                     record[field] = details[field]
-            if details.get("website") and not record.get("website"):
+            if not record.get("website") and details.get("website"):
                 record["website"] = details["website"]
+            if not record.get("description") and details.get("description"):
+                record["description"] = details["description"]
             return record
 
         with ThreadPoolExecutor(max_workers=8) as pool:
@@ -1193,8 +1383,14 @@ if __name__ == "__main__":
                 done += 1
                 if done % 10 == 0:
                     print(f"  Resolved {done}/{len(missing_addr)}...")
-        filled = sum(1 for i in missing_addr if records[i].get("street"))
-        print(f"  Resolution complete — filled {filled}/{len(missing_addr)} missing addresses.")
+        filled_street = sum(1 for i in missing_addr if records[i].get("street"))
+        filled_phone  = sum(1 for i in missing_addr if records[i].get("phone"))
+        filled_desc   = sum(1 for i in missing_addr if records[i].get("description"))
+        print(f"  Resolution complete — address: +{filled_street}  phone: +{filled_phone}  description: +{filled_desc}")
+        remaining = sum(1 for r in records if not r.get("phone") or not r.get("description"))
+        if remaining:
+            print(f"  {remaining} records still missing phone/description")
+            print(f"  Tip: if detail pages are JS-rendered, run: scrape-resolve <csv_path>")
 
     # ── State backfill ───────────────────────────────────────────────────────
     # If state is blank on every record, infer it from the source domain.
@@ -1264,5 +1460,7 @@ if __name__ == "__main__":
         writer.writerows(records)
 
     print(f"\n✅ Done — {len(records)} records saved to {output_file}")
-    print(f"   With address: {sum(1 for r in records if r.get('street'))}")
-    print(f"   With website: {sum(1 for r in records if r.get('website'))}")
+    print(f"   With address:     {sum(1 for r in records if r.get('street'))}")
+    print(f"   With phone:       {sum(1 for r in records if r.get('phone'))}")
+    print(f"   With website:     {sum(1 for r in records if r.get('website'))}")
+    print(f"   With description: {sum(1 for r in records if r.get('description'))}")
