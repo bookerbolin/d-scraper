@@ -90,45 +90,6 @@ class ScrapeResponse(BaseModel):
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
 
 
-def resolve_charleston_detail(detail_url):
-    """Fetch a charleston.com/businesses/ detail page and extract address/phone/website."""
-    try:
-        r = requests.get(detail_url, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-        # Remove nav/footer noise
-        for tag in soup.find_all(["nav", "footer", "header"]):
-            tag.decompose()
-        result = {}
-        # Website — first outbound link not on charleston.com
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("http") and "charleston.com" not in href and                not any(s in href for s in ["facebook", "instagram", "twitter",
-                                           "yelp", "google", "tripadvisor"]):
-                result["website"] = href
-                break
-        # Phone
-        tel = soup.find("a", href=re.compile(r"^tel:"))
-        if tel:
-            result["phone"] = extract_phone(tel["href"])
-        # Address — scan for structured address block or text
-        for tag in soup.find_all(["p", "div", "span", "address"]):
-            text = tag.get_text(separator=" ", strip=True)
-            if looks_like_address(text):
-                result["street"] = clean_address(text)
-                break
-            elif len(text) > 30:
-                extracted = extract_address_from_text(text)
-                if extracted:
-                    result["street"] = extracted
-                    break
-        return result
-    except Exception:
-        return {}
-
-
-
-
 def extract_phone(text):
     """Extract first phone number from text. Returns (XXX) XXX-XXXX format."""
     tel_match = re.search(r'tel:\+?1?(\d{10})', text)
@@ -218,15 +179,13 @@ def detect_city(url):
 
 
 def is_simpleview(url):
-    parsed = urlparse(url)
-    domain = parsed.netloc.lower()
-    for indicator in ["visitchapelhill", "visitraleigh", "visitdurham", "exploreraleigh", "visitnc", "visitcary"]:
-        if indicator in domain:
-            return True
+    """Detect SimpleView CMS by checking page HTML for SimpleView signatures."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         text = r.text
-        has_sv = "/includes/public/assets/" in text
+        has_sv = ("/includes/public/assets/" in text
+                  or "/includes/rest_v2/" in text
+                  or "simpleviewinc.com" in text)
         is_wix = "wix.com" in text or "wixstatic.com" in text
         is_sq = "squarespace.com" in text or "sqsp.net" in text
         is_wp = "wp-content/" in text or "wp-includes/" in text
@@ -651,10 +610,10 @@ def parse_listings(soup):
             city = location.split(",")[0].strip() if location else ""
             records.append({
                 "name": name, "street": "", "phone": "", "city": city,
-                "state": "SC", "zip": "", "website": detail_url, "description": "",
+                "state": "", "zip": "", "website": detail_url, "description": "",
             })
         if records:
-            return records, "charleston-style"
+            return records, "businesses-directory"
 
 
     # Pattern 9: GoSouthSavannah / editorial h3 prose style
@@ -875,22 +834,21 @@ def scrape_html(start_url):
     js_detected = False
     # Detect WordPress /page/N/ style pagination from first page
     wp_page_style = False
+    _start_page_size = 0  # auto-detected offset pagination page size
     while page <= MAX_PAGES:
         # Try multiple pagination styles
         if page == 1:
             url = start_url
-        elif "discoverdurham.com" in start_url:
-            sep = "&" if "?" in start_url else "?"
-            url = f"{start_url}{sep}page={page}&"
-        elif "charleston.com" in start_url:
-            sep = "&" if "?" in start_url else "?"
-            url = f"{start_url}{sep}start={(page-1)*20}"
         elif wp_page_style:
             # WordPress /page/N/ style: insert /page/N/ before query string
             from urllib.parse import urlparse as _ulp, urlunparse as _uu
             _p = _ulp(start_url)
             _path = _p.path.rstrip("/")
             url = _uu(_p._replace(path=f"{_path}/page/{page}/"))
+        elif "_start_page_size" in dir() and _start_page_size:
+            # Offset-style pagination: ?start=0, ?start=20, ?start=40 etc.
+            sep = "&" if "?" in start_url else "?"
+            url = f"{start_url}{sep}start={(page-1)*_start_page_size}"
         else:
             # Build paginated URL by injecting page param, preserving existing query params
             from urllib.parse import urlparse as _ulp, parse_qs as _pqs, urlencode as _ue, urlunparse as _uu
@@ -907,13 +865,25 @@ def scrape_html(start_url):
             soup = fetch_soup(url)
         except Exception:
             break
-        # Detect WordPress /page/N/ style on first page
+        # Detect pagination style from first page links
         if page == 1:
             import re as _re
             _next_links = soup.find_all("a", href=_re.compile(r'/page/\d+/'))
             if _next_links:
                 wp_page_style = True
                 log("  Detected WordPress /page/N/ pagination")
+            # Detect start=N offset pagination from next/pager links
+            _start_links = soup.find_all("a", href=_re.compile(r'[?&]start=\d+'))
+            if _start_links:
+                import urllib.parse as _ulps
+                _start_vals = []
+                for _sl in _start_links:
+                    _m = _re.search(r'[?&]start=(\d+)', _sl["href"])
+                    if _m:
+                        _start_vals.append(int(_m.group(1)))
+                if _start_vals:
+                    _start_page_size = min(_start_vals)
+                    log(f"  Detected start=N pagination (page size: {_start_page_size})")
         listings, pattern = parse_listings(soup)
         if not listings:
             if page == 1:
@@ -1113,9 +1083,10 @@ def run_scrape(url):
         s = _re3.sub(r"[^a-z0-9]+", "-", s)
         return s.strip("-")
 
-    DETAIL_URL_BUILDERS = {
-        "thinkiowacity.com": lambda name, base: f"https://thinkiowacity.com/listing/{_name_to_slug(name)}/",
-    }
+    DETAIL_URL_BUILDERS = {}
+    # Detail URL builders would go here for sites where detail page URLs
+    # cannot be captured from card links and must be constructed from name.
+    # Currently empty — all known sites have capturable links.
 
     if is_simpleview(url):
         records = scrape_simpleview_api(url)
@@ -1157,27 +1128,6 @@ async def scrape(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scrape failed: {str(e)}")
 
-    # Resolution pass for charleston.com detail pages
-    if "charleston.com" in url:
-        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-        internal = [i for i, r in enumerate(records)
-                    if r.get("website") and "charleston.com/businesses" in r["website"]]
-        if internal:
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {pool.submit(resolve_charleston_detail, records[i]["website"]): i
-                           for i in internal}
-                for future in _as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        details = future.result(timeout=15)
-                        if details.get("street"):
-                            records[idx]["street"] = details["street"]
-                        if details.get("phone") and not records[idx].get("phone"):
-                            records[idx]["phone"] = details["phone"]
-                        if details.get("website"):
-                            records[idx]["website"] = details["website"]
-                    except Exception:
-                        pass
 
     # Ensure all records have all fields
     clean = []
@@ -1192,6 +1142,14 @@ async def scrape(
             description=r.get("description", ""),
             source_url=r.get("source_url", url),
         ))
+
+    if js_detected:
+        message = (
+            "This page renders its listings via JavaScript and cannot be scraped "
+            "through the API. Use the command-line scraper instead: "
+            "`scrape-js <url>` (requires Playwright). "
+            "The API only handles server-rendered HTML pages."
+        )
 
     return ScrapeResponse(
         success=not js_detected,

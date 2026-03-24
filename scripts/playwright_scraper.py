@@ -209,7 +209,6 @@ def resolve_detail_page(detail_url, source_domain=None):
 
 
 # Keep old name as alias for backward compat
-resolve_exploregeorgia_detail = resolve_detail_page
 
 
 
@@ -784,11 +783,10 @@ def scrape_all_pages(start_url):
                 decoded = _upd.unquote(url)
                 has_skip = '"skip"' in decoded
                 has_count_true = '"count":true' in decoded
-                has_filter_tags = 'filter_tags' in decoded
-                if has_filter_tags:
-                    # Score: count=true is best, skip is next
-                    score = (2 if has_count_true else 0) + (1 if has_skip else 0)
-                    candidate_urls.append((score, url))
+                # Accept any listings/find call — sites use different filter structures
+                # ($and filters, filter_tags, etc.)
+                score = (2 if has_count_true else 0) + (1 if has_skip else 0)
+                candidate_urls.append((score, url))
 
         page.on("response", handle_response)
 
@@ -961,13 +959,20 @@ def scrape_all_pages(start_url):
             continue
         addr = item.get("address1", item.get("address", ""))
         name = item.get("title", item.get("name", ""))
-        # Construct SimpleView detail URL from recid + name slug
-        # Pattern: /listing/name-slug/recid/
-        recid = item.get("recid", item.get("id", ""))
-        detail_url = ""
-        if recid and name:
-            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-            detail_url = f"{_sv_base}/listing/{slug}/{recid}/"
+        # Use the url field directly — SimpleView returns /listing/slug/recid/
+        # Fall back to constructing from recid + name slug if url not present
+        sv_url = item.get("url", "")
+        if sv_url and not sv_url.startswith("http"):
+            detail_url = f"{_sv_base}{sv_url}"
+        else:
+            recid = item.get("recid", item.get("id", ""))
+            if recid and name:
+                slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+                detail_url = f"{_sv_base}/listing/{slug}/{recid}/"
+            else:
+                detail_url = ""
+        # weburl is the external business website; url is the CVB detail page
+        ext_website = item.get("weburl", item.get("website", ""))
         records.append({
             "name":        name,
             "street":      addr,
@@ -975,7 +980,7 @@ def scrape_all_pages(start_url):
             "state":       item.get("state", ""),
             "zip":         item.get("zip", ""),
             "phone":       item.get("phone", item.get("phoneNumber", "")),
-            "website":     item.get("weburl", item.get("url", item.get("website", ""))),
+            "website":     ext_website,
             "description": item.get("description", item.get("teaser", "")),
             "source_url":  start_url,
             "_detail_url": detail_url,

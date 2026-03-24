@@ -31,44 +31,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
 
-def resolve_charleston_detail(detail_url):
-    """Fetch a charleston.com/businesses/ detail page and extract address/phone/website."""
-    try:
-        r = requests.get(detail_url, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
-        for tag in soup.find_all(["nav", "footer", "header"]):
-            tag.decompose()
-        result = {}
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("http") and "charleston.com" not in href and                not any(s in href for s in ["facebook", "instagram", "twitter",
-                                           "yelp", "google", "tripadvisor"]):
-                result["website"] = href
-                break
-        tel = soup.find("a", href=re.compile(r"^tel:"))
-        if tel:
-            result["phone"] = extract_phone(tel["href"])
-        for tag in soup.find_all(["p", "div", "span", "address"]):
-            text = tag.get_text(separator=" ", strip=True)
-            if looks_like_address(text):
-                result["street"] = clean_address(text)
-                break
-            elif len(text) > 30:
-                extracted = extract_address_from_text(text)
-                if extracted:
-                    result["street"] = extracted
-                    break
-        return result
-    except Exception:
-        return {}
-
-
-
-OUTPUT_FIELDS = ["name", "street", "city", "state", "zip", "phone", "website", "description", "source_url"]
-MAX_PAGES = 20
-
-
 def looks_like_address(text):
     if not text or len(text) > 120:
         return False
@@ -157,15 +119,13 @@ def detect_city(url):
 
 
 def is_simpleview(url):
-    parsed = urlparse(url)
-    domain = parsed.netloc.lower()
-    for indicator in ["visitchapelhill", "visitraleigh", "visitdurham", "exploreraleigh", "visitnc", "visitcary"]:
-        if indicator in domain:
-            return True
+    """Detect SimpleView CMS by checking page HTML for SimpleView signatures."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         text = r.text
-        has_sv = "/includes/public/assets/" in text
+        has_sv = ("/includes/public/assets/" in text
+                  or "/includes/rest_v2/" in text
+                  or "simpleviewinc.com" in text)
         is_wix = "wix.com" in text or "wixstatic.com" in text
         is_sq = "squarespace.com" in text or "sqsp.net" in text
         is_wp = "wp-content/" in text or "wp-includes/" in text
@@ -594,10 +554,10 @@ def parse_listings(soup):
             city = location.split(",")[0].strip() if location else ""
             records.append({
                 "name": name, "street": "", "phone": "", "city": city,
-                "state": "SC", "zip": "", "website": detail_url, "description": "",
+                "state": "", "zip": "", "website": detail_url, "description": "",
             })
         if records:
-            return records, "charleston-style"
+            return records, "businesses-directory"
 
 
     # Pattern 9: GoSouthSavannah / editorial h3 prose style
@@ -826,22 +786,21 @@ def scrape_html(start_url, log=print):
     js_detected = False
     # Detect WordPress /page/N/ style pagination from first page
     wp_page_style = False
+    _start_page_size = 0  # auto-detected offset pagination page size
     while page <= MAX_PAGES:
         # Try multiple pagination styles
         if page == 1:
             url = start_url
-        elif "discoverdurham.com" in start_url:
-            sep = "&" if "?" in start_url else "?"
-            url = f"{start_url}{sep}page={page}&"
-        elif "charleston.com" in start_url:
-            sep = "&" if "?" in start_url else "?"
-            url = f"{start_url}{sep}start={(page-1)*20}"
         elif wp_page_style:
             # WordPress /page/N/ style: insert /page/N/ before query string
             from urllib.parse import urlparse as _ulp, urlunparse as _uu
             _p = _ulp(start_url)
             _path = _p.path.rstrip("/")
             url = _uu(_p._replace(path=f"{_path}/page/{page}/"))
+        elif "_start_page_size" in dir() and _start_page_size:
+            # Offset-style pagination: ?start=0, ?start=20, ?start=40 etc.
+            sep = "&" if "?" in start_url else "?"
+            url = f"{start_url}{sep}start={(page-1)*_start_page_size}"
         else:
             # Build paginated URL by injecting page param, preserving existing query params
             from urllib.parse import urlparse as _ulp, parse_qs as _pqs, urlencode as _ue, urlunparse as _uu
@@ -860,13 +819,25 @@ def scrape_html(start_url, log=print):
         except Exception as e:
             log(f"  Error: {e}")
             break
-        # Detect WordPress /page/N/ style on first page
+        # Detect pagination style from first page links
         if page == 1:
             import re as _re
             _next_links = soup.find_all("a", href=_re.compile(r'/page/\d+/'))
             if _next_links:
                 wp_page_style = True
                 log("  Detected WordPress /page/N/ pagination")
+            # Detect start=N offset pagination from next/pager links
+            _start_links = soup.find_all("a", href=_re.compile(r'[?&]start=\d+'))
+            if _start_links:
+                import urllib.parse as _ulps
+                _start_vals = []
+                for _sl in _start_links:
+                    _m = _re.search(r'[?&]start=(\d+)', _sl["href"])
+                    if _m:
+                        _start_vals.append(int(_m.group(1)))
+                if _start_vals:
+                    _start_page_size = min(_start_vals)
+                    log(f"  Detected start=N pagination (page size: {_start_page_size})")
         listings, pattern = parse_listings(soup)
         if not listings:
             if page == 1:
@@ -1133,9 +1104,10 @@ def main():
         s = _re2.sub(r"[^a-z0-9]+", "-", s)
         return s.strip("-")
 
-    DETAIL_URL_BUILDERS = {
-        "thinkiowacity.com": lambda name, base: f"https://thinkiowacity.com/listing/{_name_to_slug(name)}/",
-    }
+    DETAIL_URL_BUILDERS = {}
+    # Detail URL builders would go here for sites where detail page URLs
+    # cannot be captured from card links and must be constructed from name.
+    # Currently empty — all known sites have capturable links.
     _source_netloc2 = urlparse(url).netloc.replace("www.", "")
     _builder = DETAIL_URL_BUILDERS.get(_source_netloc2)
     if _builder:
