@@ -712,19 +712,32 @@ def parse_listings(soup, source_domain=""):
 
             text = card.get_text(separator=" ", strip=True)
 
-            # Try full "Street, City, State ZIP" pattern
+            # Try <address> tag first — handles <br>-separated street/city lines
             street = city_val = state_val = zip_val = ""
-            full_addr = re.search(
-                r'(\d+[^,]{3,40}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
-                text
-            )
-            if full_addr:
-                street    = full_addr.group(1).strip()
-                city_val  = full_addr.group(2).strip()
-                state_val = full_addr.group(3).strip()
-                zip_val   = full_addr.group(4).strip()
-            else:
-                street = clean_address(extract_address_from_text(text))
+            addr_tag = card.find("address")
+            if addr_tag:
+                parts = [s.strip() for s in addr_tag.get_text(separator="\n").split("\n") if s.strip()]
+                joined = ", ".join(parts)
+                m = re.search(r'(\d+[^,\n]{2,60}),\s*([A-Za-z][^,\n]{1,40}),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', joined)
+                if m:
+                    street    = m.group(1).strip()
+                    city_val  = m.group(2).strip()
+                    state_val = normalize_state(m.group(3).strip())
+                    zip_val   = m.group(4).strip()
+
+            # Try full "Street, City, State ZIP" from card text
+            if not street:
+                full_addr = re.search(
+                    r'(\d+[^,]{3,40}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
+                    text
+                )
+                if full_addr:
+                    street    = full_addr.group(1).strip()
+                    city_val  = full_addr.group(2).strip()
+                    state_val = normalize_state(full_addr.group(3).strip())
+                    zip_val   = full_addr.group(4).strip()
+                else:
+                    street = clean_address(extract_address_from_text(text))
 
             phone_el = card.find("a", href=re.compile(r'^tel:'))
             phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
