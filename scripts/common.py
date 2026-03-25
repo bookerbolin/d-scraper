@@ -7,6 +7,8 @@ import csv
 import time
 from urllib.parse import urlparse
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
 STATE_ABBR = {
     "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
     "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
@@ -188,7 +190,6 @@ def resolve_detail_page(detail_url, source_domain=None):
     """
     import requests as _req
     from bs4 import BeautifulSoup as _BS
-    HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     if source_domain is None:
         source_domain = urlparse(detail_url).netloc
 
