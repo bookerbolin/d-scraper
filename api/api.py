@@ -25,6 +25,12 @@ from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from common import (
+    normalize_state, extract_phone, extract_address_from_text,
+    clean_address, looks_like_address, _extract_best_description, resolve_detail_page,
+    STATE_ABBR, DOMAIN_STATE, HEADERS,
+)
+
 # ── App setup ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -87,80 +93,9 @@ class ScrapeResponse(BaseModel):
 
 # ── Scraper logic (same as scraper.py) ───────────────────────────────────────
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
-
-
-def extract_phone(text):
-    """Extract first phone number from text. Returns (XXX) XXX-XXXX format."""
-    tel_match = re.search(r'tel:\+?1?(\d{10})', text)
-    if tel_match:
-        digits = tel_match.group(1)
-        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-    pattern = re.compile(r'(\(?\d{3}\)?[\s\-\.]\d{3}[\s\-\.]\d{4})')
-    match = pattern.search(text)
-    if match:
-        digits = re.sub(r'\D', '', match.group(1))
-        if len(digits) == 10:
-            return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-    return ""
-
 
 
 MAX_PAGES = 20
-
-
-def looks_like_address(text):
-    if not text or len(text) > 120:
-        return False
-    has_number = bool(re.search(r"\b\d+\b", text))
-    if not has_number:
-        return False
-    street_types = [
-        "street", "st", "avenue", "ave", "boulevard", "blvd",
-        "road", "rd", "drive", "dr", "lane", "ln",
-        "circle", "cir", "highway", "hwy",
-        "parkway", "pkwy", "terrace", "ter",
-        "trail", "trl", "pike", "alley", "broadway",
-    ]
-    text_lower = text.lower()
-    has_street_type = any(re.search(r"\b" + re.escape(s) + r"\.?\b", text_lower) for s in street_types)
-    noise_words = ["phone", "website", "features", "details", "social", "lunch", "open", "outdoor"]
-    has_noise = sum(1 for w in noise_words if w in text_lower) >= 2
-    return has_street_type and not has_noise
-
-
-def extract_address_from_text(text):
-    if not text:
-        return ""
-    street_types = (
-        "street|st(?:\\.|\\b)|avenue|ave(?:\\.|\\b)|boulevard|blvd(?:\\.|\\b)|"
-        "road|rd(?:\\.|\\b)|drive|lane|ln(?:\\.|\\b)|"
-        "circle|cir(?:\\.|\\b)|highway|hwy(?:\\.|\\b)|parkway|pkwy(?:\\.|\\b)|"
-        "terrace|ter(?:\\.|\\b)|trail|trl(?:\\.|\\b)|pike|alley|broadway"
-    )
-    false_pos = re.compile(
-        r"\d+\s+(beers?|ingredient|piece|item|year|day|hour|minute|mile|foot|feet|oz|lb)\b",
-        re.IGNORECASE
-    )
-    if false_pos.search(text):
-        return ""
-    pattern = re.compile(
-        r"(?<!\d)(\d{1,5}\s+(?:[A-Za-z][\w\s\.]{0,40}?\s+)?(?:" + street_types + r")\.?(?:\s*,?\s*(?:Suite|Ste|Apt|Unit|#)\s*[\w]+)?)",
-        re.IGNORECASE
-    )
-    match = pattern.search(text)
-    return match.group(1).strip().rstrip(",") if match else ""
-
-
-def clean_address(text):
-    match = re.search(r"\bAddress\s+([^\n]+)", text, re.IGNORECASE)
-    if match:
-        text = match.group(1).strip()
-    text = re.sub(
-        r"\s+(features|phone|website|social info|open late|outdoor|lunch|breakfast|dinner)\b.*$",
-        "", text, flags=re.IGNORECASE
-    ).strip()
-    return text
 
 
 def fetch_soup(url, timeout=15):
@@ -918,52 +853,6 @@ def scrape_html(start_url):
         page += 1
         time.sleep(0.8)
     return all_records, js_detected
-
-
-def _extract_best_description(soup, record=None):
-    """Extract best prose description from a page without relying on specific labels."""
-    import re as _re2
-    LABEL_WORDS = _re2.compile(
-        r"\b(about|description|overview|details|info|information|story|"
-        r"summary|profile|who we are|our story|mission)\b", _re2.I
-    )
-    NOISE_START = _re2.compile(
-        r"^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|"
-        r"address|directions|map|parking|admission|\$|\u00a9|privacy|"
-        r"terms|cookie|follow us|share|tweet|subscribe|powered by|all rights reserved"
-        r"|\d+\s+\w+.{0,40}(?:st|ave|rd|dr|blvd|ln|way|street|avenue|road|drive|boulevard)\b)",
-        _re2.I
-    )
-    DATA_HEAVY = _re2.compile(r"(\d{5}|\(\d{3}\)|\d{1,2}:\d{2}\s*(am|pm))", _re2.I)
-    name = (record or {}).get("name", "")
-
-    def score_block(txt):
-        if len(txt) < 60 or len(txt) > 800: return 0
-        if NOISE_START.match(txt): return 0
-        if DATA_HEAVY.search(txt[:40]): return 0
-        s = 0
-        if txt[0].isupper(): s += 1
-        if _re2.search(r"[.!?]\s", txt) or txt[-1] in ".!?": s += 1
-        if 80 < len(txt) < 500: s += 2
-        if name and txt.strip().lower() == name.strip().lower(): return 0
-        return s
-
-    candidates = []
-    for tag in soup.find_all(["p", "dd", "div", "span", "li", "section"]):
-        if tag.find(["p", "dd", "div", "section"]): continue
-        txt = _re2.sub(r"\s+", " ", tag.get_text(separator=" ", strip=True)).strip()
-        s = score_block(txt)
-        if s > 0:
-            prev = tag.find_previous(["h2","h3","h4","button","dt","strong","b"])
-            if prev and LABEL_WORDS.search(prev.get_text(strip=True)):
-                s += 3
-            if tag.find_parent(class_=_re2.compile(r"active|open|expanded", _re2.I)):
-                s += 2
-            candidates.append((s, txt))
-
-    if not candidates: return ""
-    candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
-    return candidates[0][1][:400]
 
 
 def resolve_website(record, source_domain):
