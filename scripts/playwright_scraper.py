@@ -1523,6 +1523,20 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
                     if desc:
                         record["description"] = desc
                         filled_desc += 1
+
+                if not record.get("website"):
+                    _source_nl = urlparse(detail_url).netloc
+                    _SKIP_NL = {"facebook.com","instagram.com","twitter.com","x.com",
+                                "yelp.com","tripadvisor.com","google.com","maps.google.com"}
+                    for _a in soup.find_all("a", href=True):
+                        _href = _a["href"]
+                        _nl = urlparse(_href).netloc
+                        if (_nl and _nl != _source_nl
+                                and not any(s in _nl for s in _SKIP_NL)
+                                and _href.startswith("http")
+                                and not _href.endswith((".pdf",".jpg",".png"))):
+                            record["website"] = _href
+                            break
             except Exception:
                 pass
 
@@ -1635,10 +1649,20 @@ if __name__ == "__main__":
         if _probe_url:
             try:
                 from bs4 import BeautifulSoup as _BS2
-                _probe = _rq2.get(_probe_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-                _probe_text = _BS2(_probe.text, "lxml").get_text(strip=True)
-                _js_rendered = len(_probe_text) < 500 or "browser is not supported" in _probe_text
-                print(f"  Probed {_probe_url[:60]}... JS-rendered: {_js_rendered}")
+                _probe_headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+                _probe = _rq2.get(_probe_url, headers=_probe_headers, timeout=8)
+                _probe_soup = _BS2(_probe.text, "lxml")
+                for _t in _probe_soup(["nav","header","footer"]): _t.decompose()
+                _probe_text = _probe_soup.get_text(strip=True)
+                # JS-rendered if: very little text, or has "browser not supported",
+                # or has no tel: links AND no address-like content despite being a detail page
+                _has_tel = bool(_probe_soup.find("a", href=lambda h: h and h.startswith("tel:")))
+                _has_addr = bool(_probe_soup.find("address") or
+                                 _probe_soup.find(class_=lambda c: c and "address" in " ".join(c).lower() if c else False))
+                _js_rendered = (len(_probe_text) < 500
+                                or "browser is not supported" in _probe_text
+                                or (not _has_tel and not _has_addr and len(_probe_text) < 2000))
+                print(f"  Probed {_probe_url[:60]}... text={len(_probe_text)} tel={_has_tel} addr={_has_addr} JS={_js_rendered}")
             except Exception as _pe:
                 print(f"  Probe failed: {_pe}")
 
