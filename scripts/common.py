@@ -24,6 +24,35 @@ STATE_ABBR = {
     "puerto rico": "PR", "guam": "GU", "virgin islands": "VI",
 }
 
+DOMAIN_STATE = {
+    "annarbor.org": "MI", "visitannarbor.org": "MI",
+    "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
+    "visitathensga.com": "GA", "exploregeorgia.org": "GA",
+    "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
+    "visitchapelhill.org": "NC", "visitraleigh.com": "NC",
+    "discoverdurham.com": "NC", "downtowndurham.com": "NC",
+    "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
+    "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
+    "discoverburkecounty.com": "NC", "charlottesgotalot.com": "NC",
+    "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
+    "charleston.com": "SC",
+    "bouldercoloradousa.com": "CO",
+    "visitithaca.com": "NY",
+    "thinkiowacity.com": "IA",
+    "helloburlingtonvt.com": "VT",
+    "austintexas.org": "TX",
+    "visitcharlottesville.org": "VA",
+    "visitrichmondva.com": "VA",
+    "venturerichmond.com": "VA",
+    "visitslo.com": "CA",
+    "visitberkeley.com": "CA",
+    "visitcorvallis.com": "OR",
+    "eugenecascadescoast.org": "OR",
+    "bellingham.org": "WA",
+    "destinationmissoula.org": "MT",
+    "santabarbaraca.com": "CA",
+}
+
 
 def normalize_state(raw):
     """Convert full state name or 2-letter abbreviation to uppercase abbreviation."""
@@ -284,4 +313,3 @@ def looks_like_address(text):
     noise_words = ["phone", "website", "features", "details", "social", "lunch", "open", "outdoor"]
     has_noise = sum(1 for w in noise_words if w in text_lower) >= 2
     return has_street_type and not has_noise
-

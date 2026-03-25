@@ -1615,38 +1615,6 @@ if __name__ == "__main__":
     # If state is blank on every record, infer it from the source domain.
     # This handles SimpleView CVB sites where state never appears in the API response.
     # We don't guess zip — multiple cities in a region means multiple zips.
-    DOMAIN_STATE = {
-        # Michigan
-        "annarbor.org": "MI", "visitannarbor.org": "MI",
-        # Wisconsin
-        "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
-        # Georgia
-        "visitathensga.com": "GA", "exploregeorgia.org": "GA",
-        "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
-        # North Carolina
-        "visitchapelhill.org": "NC", "visitraleigh.com": "NC",
-        "discoverdurham.com": "NC", "downtowndurham.com": "NC",
-        "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
-        "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
-        "discoverburkecounty.com": "NC", "charlottesgotalot.com": "NC",
-        # South Carolina
-        "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
-        "charleston.com": "SC",
-        # Colorado
-        "bouldercoloradousa.com": "CO",
-        # New York
-        "visitithaca.com": "NY",
-        # Iowa
-        "thinkiowacity.com": "IA",
-        # Vermont
-        "helloburlingtonvt.com": "VT",
-        # Texas
-        "austintexas.org": "TX",
-        # Virginia
-        "visitcharlottesville.org": "VA",
-        "visitrichmondva.com": "VA",
-        "venturerichmond.com": "VA",
-    }
     source_netloc = urlparse(url).netloc.replace("www.", "")
     inferred_state = DOMAIN_STATE.get(source_netloc, "")
     if inferred_state:

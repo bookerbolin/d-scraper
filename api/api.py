@@ -1044,27 +1044,6 @@ def run_scrape(url):
     records = resolve_all(records, urlparse(url).netloc)
 
     # State backfill — infer from source domain if records are missing state
-    DOMAIN_STATE = {
-        "annarbor.org": "MI", "visitannarbor.org": "MI",
-        "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
-        "visitathensga.com": "GA", "exploregeorgia.org": "GA",
-        "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
-        "visitchapelhill.org": "NC", "visitraleigh.com": "NC",
-        "discoverdurham.com": "NC", "downtowndurham.com": "NC",
-        "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
-        "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
-        "discoverburkecounty.com": "NC", "charlottesgotalot.com": "NC",
-        "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
-        "charleston.com": "SC",
-        "bouldercoloradousa.com": "CO",
-        "visitithaca.com": "NY",
-        "thinkiowacity.com": "IA",
-        "helloburlingtonvt.com": "VT",
-        "austintexas.org": "TX",
-        "visitcharlottesville.org": "VA",
-        "visitrichmondva.com": "VA",
-        "venturerichmond.com": "VA",
-    }
     _source_netloc = urlparse(url).netloc.replace("www.", "")
     _inferred_state = DOMAIN_STATE.get(_source_netloc, "")
     if _inferred_state:
