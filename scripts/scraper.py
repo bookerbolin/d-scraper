@@ -875,6 +875,51 @@ def scrape_html(start_url, log=print):
     return all_records, js_detected
 
 
+def _extract_best_description(soup, record=None):
+    """Extract best prose description from a page without relying on specific labels."""
+    import re as _re2
+    LABEL_WORDS = _re2.compile(
+        r"\b(about|description|overview|details|info|information|story|"
+        r"summary|profile|who we are|our story|mission)\b", _re2.I
+    )
+    NOISE_START = _re2.compile(
+        r"^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|"
+        r"address|directions|map|parking|admission|\$|\u00a9|privacy|"
+        r"terms|cookie|follow us|share|tweet|subscribe|powered by|all rights reserved)",
+        _re2.I
+    )
+    DATA_HEAVY = _re2.compile(r"(\d{5}|\(\d{3}\)|\d{1,2}:\d{2}\s*(am|pm))", _re2.I)
+    name = (record or {}).get("name", "")
+
+    def score_block(txt):
+        if len(txt) < 60 or len(txt) > 800: return 0
+        if NOISE_START.match(txt): return 0
+        if DATA_HEAVY.search(txt[:40]): return 0
+        s = 0
+        if txt[0].isupper(): s += 1
+        if _re2.search(r"[.!?]\s", txt) or txt[-1] in ".!?": s += 1
+        if 80 < len(txt) < 500: s += 2
+        if name and txt.strip().lower() == name.strip().lower(): return 0
+        return s
+
+    candidates = []
+    for tag in soup.find_all(["p", "dd", "div", "span", "li", "section"]):
+        if tag.find(["p", "dd", "div", "section"]): continue
+        txt = _re2.sub(r"\s+", " ", tag.get_text(separator=" ", strip=True)).strip()
+        s = score_block(txt)
+        if s > 0:
+            prev = tag.find_previous(["h2","h3","h4","button","dt","strong","b"])
+            if prev and LABEL_WORDS.search(prev.get_text(strip=True)):
+                s += 3
+            if tag.find_parent(class_=_re2.compile(r"active|open|expanded", _re2.I)):
+                s += 2
+            candidates.append((s, txt))
+
+    if not candidates: return ""
+    candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+    return candidates[0][1][:400]
+
+
 def resolve_website(record, source_domain):
     # Always prefer _detail_url for fetching — it's the CVB detail page
     # which has phone/description, unlike the external business website
@@ -935,9 +980,21 @@ def resolve_website(record, source_domain):
                             record["street"] = addr
                     break
 
-        # Fallback address: scan page text
+        # Extract address — try semantic <address> tag first, then text scan
         if not record.get("street"):
-            for tag in soup.find_all(["p", "li", "div", "span", "address"]):
+            addr_tag = soup.find("address")
+            if addr_tag:
+                addr_text = re.sub(r'[\xa0\s]+', ' ', addr_tag.get_text(separator=" ", strip=True))
+                m = re.search(r'(\d+[^,]{2,60}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', addr_text)
+                if m:
+                    record["street"] = m.group(1).strip()
+                    if not record.get("city"):  record["city"]  = m.group(2).strip()
+                    if not record.get("state"): record["state"] = normalize_state(m.group(3).strip())
+                    if not record.get("zip"):   record["zip"]   = m.group(4).strip()
+                elif addr_text:
+                    record["street"] = clean_address(addr_text) or addr_text[:80]
+        if not record.get("street"):
+            for tag in soup.find_all(["p", "li", "div", "span"]):
                 text = tag.get_text(separator=" ", strip=True)
                 if looks_like_address(text):
                     record["street"] = clean_address(text)
@@ -982,28 +1039,11 @@ def resolve_website(record, source_domain):
             if found_website:
                 record["website"] = found_website
 
-        # Extract description using scored text blocks (language/class agnostic)
+        # Extract description using best-scored prose block
         if not record.get("description"):
-            import re as _re_d
-            _NOISE = _re_d.compile(
-                r'^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|'
-                r'address|directions|map|parking|admission|\$|privacy|terms|cookie|'
-                r'follow us|share|tweet|subscribe|powered by|all rights reserved)', _re_d.I)
-            _candidates = []
-            for _tag in soup.find_all(["p", "dd", "div", "li"]):
-                if _tag.find(["p", "dd", "div"]): continue
-                _txt = _re_d.sub(r'[\xa0\s]+', ' ', _tag.get_text(separator=" ", strip=True)).strip()
-                if len(_txt) < 60 or len(_txt) > 800: continue
-                if _NOISE.match(_txt): continue
-                _s = 0
-                if _txt[0].isupper(): _s += 1
-                if _re_d.search(r'[.!?]\s', _txt) or _txt[-1] in '.!?': _s += 1
-                if 80 < len(_txt) < 500: _s += 2
-                if _s > 0:
-                    _candidates.append((_s, _txt))
-            if _candidates:
-                _candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
-                record["description"] = _candidates[0][1][:400]
+            desc = _extract_best_description(soup, record)
+            if desc:
+                record["description"] = desc
 
     except Exception as e:
         record["_resolve_error"] = str(e)[:120]
