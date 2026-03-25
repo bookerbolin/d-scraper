@@ -1,6 +1,7 @@
 """
 Playwright scraper for SimpleView CMS tourism sites.
 Renders JavaScript fully before scraping, bypassing auth requirements.
+SCRAPER_VERSION = "2026-03-25-berkeley"
 
 Usage:
     python playwright_scraper.py https://www.visitchapelhill.org/things-to-do
@@ -508,7 +509,7 @@ def scrape_simpleview(start_url):
                 from collections import Counter
 
                 PHONE_RE = _re.compile(r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}')
-                ADDR_RE  = _re.compile(r'\d{1,5}\s+\w[\w\s\.]{2,30}'
+                ADDR_RE  = _re.compile(r'\d{1,5}[-\w]*\s+\w[\w\s\.]{2,30}'
                                        r'(?:St|Ave|Rd|Dr|Blvd|Ln|Way|Hwy|Pkwy|Ct|Pl|Cir|Street|Avenue|Road|Drive|Boulevard|Lane|Highway|Court|Place)\b',
                                        _re.I)
 
@@ -520,8 +521,8 @@ def scrape_simpleview(start_url):
                     if el.find(["h2","h3","h4","h5"]) or el.find(
                             class_=_re.compile(r'title|heading|name', _re.I)):
                         score += 1
-                    # Has address
-                    if ADDR_RE.search(txt):
+                    # Has address or geo coordinates
+                    if ADDR_RE.search(txt) or el.get("data-lat") or el.find(attrs={"data-lat": True}):
                         score += 1
                     # Has phone or outbound link
                     if PHONE_RE.search(txt) or el.find("a", href=_re.compile(r'^tel:')):
@@ -539,7 +540,10 @@ def scrape_simpleview(start_url):
                 DIR_LINK_RE = _re.compile(r'/(directory|listing|business|place)/', _re.I)
                 good = []
                 for el in candidates:
-                    if el.find_parent(["nav","header","footer"]):
+                    # Allow articles even if inside a nav — some sites wrap listing grids in nav
+                    if el.find_parent(["header","footer"]):
+                        continue
+                    if el.name not in ("article","section") and el.find_parent("nav"):
                         continue
                     txt = el.get_text(strip=True)
                     if len(txt) < 20 or len(txt) > 2000:
@@ -576,16 +580,25 @@ def scrape_simpleview(start_url):
                 return cards
 
             def parse_page_cards(html, parsed_netloc):
+                import re as _re
                 soup = BeautifulSoup(html, "lxml")
-                cards = infer_cards(soup)
+                # Shortcut: if page has <article> elements with headings and detail/geo signals,
+                # use them directly — more reliable than infer_cards for semantic HTML
+                _DIR_RE = _re.compile(r'/(directory|listing|business|place|eat|drink|restaurants?)/', _re.I)
+                all_articles = soup.find_all("article")
+                direct_articles = [
+                    el for el in all_articles
+                    if el.find(["h2","h3","h4","h5"])
+                    and (el.find("a", href=_DIR_RE) or el.get("data-lat"))
+                ]
+                if not direct_articles and all_articles:
+                    direct_articles = [el for el in all_articles if el.find(["h2","h3","h4","h5"])]
+                cards = direct_articles if len(direct_articles) >= 3 else infer_cards(soup)
                 results = []
                 for card in cards:
-                    # Name: first heading or title-like element in the card
-                    import re as _re
                     name_el = card.find(["h2","h3","h4","h5"]) or card.find(
                         class_=_re.compile(r'title|heading|name', _re.I))
                     name = name_el.get_text(strip=True) if name_el else ""
-                    # Fallback: first short bold/strong text
                     if not name:
                         for el in card.find_all(["strong","b","p"]):
                             t = el.get_text(strip=True)
@@ -651,6 +664,24 @@ def scrape_simpleview(start_url):
                         if not street and addr_text:
                             street = clean_address(extract_address_from_text(_norm_addr(addr_text))) or ""
 
+                    # Try hidden map tooltip (e.g. visitberkeley.com data-map-info div)
+                    if not street:
+                        map_info = card.select_one("[data-map-info] .card__summary, [class*='map'] .card__summary")
+                        if map_info:
+                            addr_text = map_info.get_text(separator=" ", strip=True)
+                            street, city_val, state_val, zip_val = _parse_addr(addr_text)
+
+                    # Try structured <p> with <br> tags (address split across lines)
+                    if not street:
+                        for p in card.find_all("p"):
+                            if p.find("br"):
+                                parts = [s.strip() for s in p.get_text(separator="\n").split("\n") if s.strip()]
+                                joined = ", ".join(parts)
+                                s, c, st, z = _parse_addr(joined)
+                                if s:
+                                    street, city_val, state_val, zip_val = s, c, st, z
+                                    break
+
                     # Also check data-* attributes on card or its children for city/zip
                     if not city_val:
                         _data_src = card.find(attrs={"data-city": True}) or card
@@ -703,8 +734,8 @@ def scrape_simpleview(start_url):
                                 break
                             elif _int and _href not in ("/", "#", "") and not detail_url:
                                 detail_url = _href if _href.startswith("http") else f"https://{parsed_netloc}{_href}"
-                                if not website:
-                                    website = detail_url
+                        # Don't set website to the internal CVB link — leave blank so
+                        # resolution pass can fill in the real external business website
                     else:
                         # External website found — also capture internal detail link separately
                         for _a in card.find_all("a", href=True):
@@ -723,7 +754,8 @@ def scrape_simpleview(start_url):
                         "card_city": card_city,
                         "website": website, "phone": phone,
                     }
-                    if detail_url and detail_url != website:
+                    # Always store internal CVB detail link — even if it doubled as website
+                    if detail_url:
                         rec["_detail_url"] = detail_url
                     results.append(rec)
                 return results, soup
@@ -1358,7 +1390,8 @@ def _extract_best_description(soup, record=None):
         r"^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|"
         r"address|directions|map|parking|admission|price|cost|\$|\u00a9|privacy|"
         r"terms|cookie|follow us|share|tweet|like|subscribe|sign up|newsletter|"
-        r"powered by|all rights reserved)", _re2.I
+        r"powered by|all rights reserved|\d+\s+\w+.{0,40}(?:st|ave|rd|dr|blvd|ln|way|street|avenue|road|drive|boulevard)\b)",
+        _re2.I
     )
     DATA_HEAVY = _re2.compile(r"(\d{5}|\(\d{3}\)|\d{1,2}:\d{2}\s*(am|pm))", _re2.I)
 
@@ -1437,7 +1470,8 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
     filled_phone = 0
     filled_desc  = 0
 
-    CONCURRENCY = 1  # Playwright sync API is not thread-safe — use sequential
+    # Sequential resolution — Playwright sync API is not thread-safe
+    # CONCURRENCY variable unused; kept for reference
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)

@@ -929,7 +929,8 @@ def _extract_best_description(soup, record=None):
     NOISE_START = _re2.compile(
         r"^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|"
         r"address|directions|map|parking|admission|\$|\u00a9|privacy|"
-        r"terms|cookie|follow us|share|tweet|subscribe|powered by|all rights reserved)",
+        r"terms|cookie|follow us|share|tweet|subscribe|powered by|all rights reserved"
+        r"|\d+\s+\w+.{0,40}(?:st|ave|rd|dr|blvd|ln|way|street|avenue|road|drive|boulevard)\b)",
         _re2.I
     )
     DATA_HEAVY = _re2.compile(r"(\d{5}|\(\d{3}\)|\d{1,2}:\d{2}\s*(am|pm))", _re2.I)
