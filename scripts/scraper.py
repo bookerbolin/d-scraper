@@ -183,7 +183,7 @@ def scrape_simpleview_api(start_url, log=print):
     return all_records
 
 
-def parse_listings(soup):
+def parse_listings(soup, source_domain=""):
     records = []
 
     # Pattern 1: Durham-style — h2 > a[href*=directory]
@@ -839,7 +839,8 @@ def scrape_html(start_url, log=print):
                 if _start_vals:
                     _start_page_size = min(_start_vals)
                     log(f"  Detected start=N pagination (page size: {_start_page_size})")
-        listings, pattern = parse_listings(soup)
+        source_domain = urlparse(url).netloc
+        listings, pattern = parse_listings(soup, source_domain)
         if not listings:
             if page == 1:
                 js_detected = True
