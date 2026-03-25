@@ -495,7 +495,9 @@ def scrape_simpleview(start_url):
                     recursive=True
                 )
 
-                # Filter: must have score >= 2, not be nav/header/footer, reasonable text length
+                # Filter: must have score >= 2, OR score >= 1 with a directory/listing detail link
+                # The latter catches CVB cards that show name+link but no address/phone in the card
+                DIR_LINK_RE = _re.compile(r'/(directory|listing|business|place)/', _re.I)
                 good = []
                 for el in candidates:
                     if el.find_parent(["nav","header","footer"]):
@@ -503,7 +505,9 @@ def scrape_simpleview(start_url):
                     txt = el.get_text(strip=True)
                     if len(txt) < 20 or len(txt) > 2000:
                         continue
-                    if card_score(el) >= 2:
+                    sc = card_score(el)
+                    has_dir_link = bool(el.find("a", href=DIR_LINK_RE))
+                    if sc >= 2 or (sc >= 1 and has_dir_link):
                         good.append(el)
 
                 if not good:
@@ -554,20 +558,65 @@ def scrape_simpleview(start_url):
 
                     text = card.get_text(separator=" ", strip=True)
 
-                    # Try full "Street, City, State ZIP" pattern first (e.g. Charlottesville cards)
+                    # First try semantic card fields (e.g. visitcharlottesville.org card__* classes)
                     import re as _re
                     street = city_val = state_val = zip_val = ""
-                    full_addr = _re.search(
-                        r'(\d+[^,]{3,40}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
-                        text
+
+                    def _norm_addr(t):
+                        """Normalize whitespace including non-breaking spaces."""
+                        return _re.sub(r'[\xa0\u2009\u202f]+', ' ', t).strip()
+
+                    _SUITE_RE = _re.compile(
+                        r'^(suite|ste\.?|unit|apt\.?|floor|fl\.?|bldg\.?|building|room|rm\.?|#|\d)',
+                        _re.I
                     )
-                    if full_addr:
-                        street   = full_addr.group(1).strip()
-                        city_val = full_addr.group(2).strip()
-                        state_val = normalize_state(full_addr.group(3).strip())
-                        zip_val  = full_addr.group(4).strip()
-                    else:
-                        street = clean_address(extract_address_from_text(text))
+
+                    def _parse_addr(addr_text):
+                        """Parse address into (street, city, state, zip). Returns all empty on failure."""
+                        addr_text = _norm_addr(addr_text)
+                        # Try 4-part: street, suite/extra, city, state zip
+                        m = _re.search(
+                            r'(\d+[^,\n]{2,60})[,\n]\s*([^,\n]{2,60})[,\n]\s*([A-Za-z][^,\n]{1,40})[,\n]\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
+                            addr_text
+                        )
+                        if m:
+                            street_part = m.group(1).strip()
+                            second_line = m.group(2).strip()
+                            city_part   = m.group(3).strip()
+                            state_part  = normalize_state(m.group(4).strip())
+                            zip_part    = m.group(5).strip()
+                            # If second line looks like a suite/unit, append to street
+                            if _SUITE_RE.match(second_line):
+                                street_part = f"{street_part}, {second_line}"
+                            else:
+                                city_part = second_line  # second line is actually city
+                            return street_part, city_part, state_part, zip_part
+                        # Try 3-part: street, city, state zip
+                        m2 = _re.search(
+                            r'(\d+[^,\n]{2,60})[,\n]\s*([A-Za-z][^,\n]{1,40})[,\n]\s*([A-Za-z ]{2,20})\s+(\d{5})\b',
+                            addr_text
+                        )
+                        if m2:
+                            city_part = m2.group(2).strip()
+                            if _SUITE_RE.match(city_part):
+                                # Suite leaked into city slot — keep street only
+                                return m2.group(1).strip(), "", normalize_state(m2.group(3).strip()), m2.group(4).strip()
+                            return m2.group(1).strip(), city_part, normalize_state(m2.group(3).strip()), m2.group(4).strip()
+                        return "", "", "", ""
+
+                    # Try semantic address element first
+                    addr_el = card.select_one(".card__address, [class*='address']")
+                    if addr_el:
+                        addr_text = addr_el.get_text(separator=" ", strip=True)
+                        street, city_val, state_val, zip_val = _parse_addr(addr_text)
+                        if not street and addr_text:
+                            street = clean_address(extract_address_from_text(_norm_addr(addr_text))) or ""
+
+                    # Fall back to full card text
+                    if not street:
+                        street, city_val, state_val, zip_val = _parse_addr(text)
+                        if not street:
+                            street = clean_address(extract_address_from_text(_norm_addr(text)))
 
                     # Capture city-only locations when no street found
                     card_city = city_val
@@ -583,20 +632,24 @@ def scrape_simpleview(start_url):
                                 card_city = line
                                 break
 
-                    # Prefer external link; fall back to same-domain detail link
+                    # Prefer card__website link, then any external link, then internal detail link
                     website = ""
-                    for _a in card.find_all("a", href=True):
-                        _href = _a["href"]
-                        _nl = urlparse(_href).netloc
-                        _ext = (_nl and _nl != parsed_netloc
-                                and not any(s in _nl for s in
-                                            ["facebook","instagram","twitter","google","yelp"]))
-                        _int = (not _nl or _nl == parsed_netloc)
-                        if _ext:
-                            website = _href
-                            break
-                        elif _int and _href not in ("/", "#", "") and not website:
-                            website = _href
+                    website_el = card.select_one(".card__website a[href], [class*='website'] a[href]")
+                    if website_el:
+                        website = website_el["href"]
+                    if not website:
+                        for _a in card.find_all("a", href=True):
+                            _href = _a["href"]
+                            _nl = urlparse(_href).netloc
+                            _ext = (_nl and _nl != parsed_netloc
+                                    and not any(s in _nl for s in
+                                                ["facebook","instagram","twitter","google","yelp"]))
+                            _int = (not _nl or _nl == parsed_netloc)
+                            if _ext:
+                                website = _href
+                                break
+                            elif _int and _href not in ("/", "#", "") and not website:
+                                website = _href
 
                     phone_el = card.select_one("a[href^='tel:']")
                     phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
@@ -635,21 +688,94 @@ def scrape_simpleview(start_url):
             except Exception:
                 pass
 
-            # Try to paginate via next button
+            # Detect pagination style from soup — language-agnostic approach:
+            # 1. Look for any "X of Y" or "X-Y of Z" counter pattern regardless of label words
+            # 2. Fall back to detecting ?page=N links in the soup
+            # 3. If neither, just try page 2 and see if new cards appear (probe approach)
+            import re as _re_pg
+            use_url_pagination = False
+            _total_listings = None
+            _total_pages = 50
+            _page_size = len(page_cards) or 12
+
+            # Strategy 1: find any counter element with "X of Y" or "X-Y of Z" pattern
+            # Matches: "1-12 of 298", "Showing 1 to 12 of 298", "Results 1-12 of 298", etc.
+            _COUNT_RE = _re_pg.compile(r'\b(\d+)\s*(?:-|to)\s*(\d+)\s+of\s+(\d+)\b')
+            for _el in soup.find_all(["p","div","span","li","small"]):
+                if _el.find(["p","div","span"]):  # skip containers
+                    continue
+                _m = _COUNT_RE.search(_el.get_text())
+                if _m:
+                    _start = int(_m.group(1))
+                    _end   = int(_m.group(2))
+                    _total = int(_m.group(3))
+                    if _total > _end > _start >= 1:  # sanity check
+                        _page_size = _end - _start + 1
+                        _total_listings = _total
+                        _total_pages = -(-_total // _page_size)
+                        print(f"  Detected {_total} total listings, {_page_size}/page → {_total_pages} pages")
+                        use_url_pagination = _total_pages > 1
+                        break
+
+            # Strategy 2: ?page=N links in soup
+            if not use_url_pagination:
+                _url_page_links = soup.find_all("a", href=_re_pg.compile(r'[?&]page=\d+'))
+                if _url_page_links:
+                    use_url_pagination = True
+                    _total_pages = 50
+                    print(f"  Detected ?page=N pagination ({len(_url_page_links)} links)")
+
+            # Strategy 3: probe page 2 — if it returns new cards, paginate
+            if not use_url_pagination and page_cards:
+                _probe_url2 = start_url.rstrip("/") + "?page=2" if "?" not in start_url else start_url + "&page=2"
+                try:
+                    page.goto(_probe_url2, wait_until="domcontentloaded", timeout=10000)
+                    time.sleep(1.5)
+                    _probe_cards, _ = parse_page_cards(page.content(), parsed.netloc)
+                    _probe_new = [c for c in _probe_cards if c["name"] not in {x["name"] for x in page_cards}]
+                    if _probe_new:
+                        use_url_pagination = True
+                        _total_pages = 50
+                        print(f"  Detected pagination via page 2 probe ({len(_probe_new)} new cards)")
+                        # Go back to page 1
+                        page.goto(start_url, wait_until="domcontentloaded", timeout=15000)
+                        time.sleep(1.5)
+                except Exception:
+                    pass
+
+            if use_url_pagination:
+                print(f"  Using URL-based ?page=N pagination")
+
+            # Try to paginate
             page_num = 1
             seen_names = {c["name"] for c in all_dom_cards}
-            max_pages = 50  # safety cap
+            max_pages = _total_pages if use_url_pagination else 50
             while page_num < max_pages:
-                next_btn = page.query_selector("a[rel='next'], .pager__item--next a, [class*='next'] a, a:has-text('Next'), button:has-text('Next')")
-                if not next_btn:
+                # Stop if we've collected enough
+                if _total_listings and len(seen_names) >= _total_listings:
                     break
                 page_num += 1
-                print(f"  Clicking to page {page_num}...")
-                page.evaluate("btn => btn.scrollIntoView({block: 'center'})", next_btn)
-                time.sleep(0.3)
-                page.evaluate("btn => btn.click()", next_btn)
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-                time.sleep(2)
+                if use_url_pagination:
+                    # Navigate directly to ?page=N
+                    from urllib.parse import urlparse as _ulp2, urlencode as _ue2, parse_qs as _pqs2, urlunparse as _uu2
+                    _pp = _ulp2(start_url)
+                    _params2 = _pqs2(_pp.query, keep_blank_values=True)
+                    _params2.pop("page", None)
+                    _params2["page"] = [str(page_num)]
+                    _next_url = _uu2(_pp._replace(query=_ue2(_params2, doseq=True)))
+                    print(f"  Fetching page {page_num}: {_next_url}")
+                    page.goto(_next_url, wait_until="domcontentloaded", timeout=15000)
+                    time.sleep(2)
+                else:
+                    next_btn = page.query_selector("a[rel='next'], .pager__item--next a, [class*='next'] a, a:has-text('Next'), button:has-text('Next')")
+                    if not next_btn:
+                        break
+                    print(f"  Clicking to page {page_num}...")
+                    page.evaluate("btn => btn.scrollIntoView({block: 'center'})", next_btn)
+                    time.sleep(0.3)
+                    page.evaluate("btn => btn.click()", next_btn)
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    time.sleep(2)
                 html = page.content()
                 page_cards, _ = parse_page_cards(html, parsed.netloc)
                 if not page_cards:
@@ -668,7 +794,7 @@ def scrape_simpleview(start_url):
             for card_data in all_dom_cards:
                 name = card_data["name"]
                 street = card_data["street"]
-                card_city  = card_data.get("city", "") or card_data.get("card_city", "") or city
+                card_city  = card_data.get("city", "") or card_data.get("card_city", "")
                 card_state = card_data.get("state", "")
                 card_zip   = card_data.get("zip", "")
                 phone = card_data.get("phone", "")
@@ -1220,7 +1346,7 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
         fieldnames = list(rows[0].keys()) if rows else OUTPUT_FIELDS
 
     needs_resolve = [i for i, r in enumerate(rows)
-                     if r.get(detail_url_field)
+                     if (r.get("_detail_url") or r.get(detail_url_field))
                      and (not r.get("phone") or not r.get("description"))]
 
     if not needs_resolve:
@@ -1233,56 +1359,87 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
     filled_phone = 0
     filled_desc  = 0
 
+    CONCURRENCY = 8  # parallel browser pages
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ))
-        page = context.new_page()
 
-        for n, i in enumerate(needs_resolve, 1):
+        # Create a pool of pages
+        pages = [context.new_page() for _ in range(CONCURRENCY)]
+        page_available = list(range(CONCURRENCY))  # indices of free pages
+        import threading
+        lock = threading.Lock()
+        filled_phone_list = [0]
+        filled_desc_list  = [0]
+        done_count = [0]
+
+        def resolve_one(slot, i):
             record = rows[i]
-            # Prefer _detail_url (CVB detail page) over website (external business site)
-            # Phone/description live on the CVB page, not the business website
             detail_url = record.get("_detail_url", "") or record.get(detail_url_field, "")
             if not detail_url:
-                continue
-
+                return
+            pg = pages[slot]
             try:
-                page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(1.5)
-
-                html = page.content()
+                pg.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+                time.sleep(1.0)
                 from bs4 import BeautifulSoup as _BS
-                soup = _BS(html, "lxml")
+                soup = _BS(pg.content(), "lxml")
                 for tag in soup(["nav", "header", "footer"]):
                     tag.decompose()
 
-                # Phone
                 if not record.get("phone"):
                     tel = soup.find("a", href=re.compile(r'^tel:'))
                     if tel:
                         phone = extract_phone(tel["href"])
                         if phone:
                             record["phone"] = phone
-                            filled_phone += 1
+                            with lock:
+                                filled_phone_list[0] += 1
 
-                # Description — find best prose block on the page
-                # Rather than hunting for a specific label, score all text blocks
-                # and pick the one that looks most like a business description.
                 if not record.get("description"):
                     desc = _extract_best_description(soup, record)
                     if desc:
                         record["description"] = desc
-                        filled_desc += 1
+                        with lock:
+                            filled_desc_list[0] += 1
+            except Exception:
+                pass
+            finally:
+                with lock:
+                    done_count[0] += 1
+                    page_available.append(slot)
 
-            except Exception as e:
-                pass  # silently skip failures
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        futures = []
+        slot_idx = 0
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+            for i in needs_resolve:
+                # Wait for a free slot
+                while True:
+                    with lock:
+                        if page_available:
+                            slot = page_available.pop(0)
+                            break
+                    time.sleep(0.1)
+                fut = executor.submit(resolve_one, slot, i)
+                futures.append(fut)
 
-            if n % 10 == 0 or n == len(needs_resolve):
-                print(f"  {n}/{len(needs_resolve)} — phone: +{filled_phone}  desc: +{filled_desc}")
+            # Progress reporting while futures complete
+            reported = 0
+            for fut in as_completed(futures):
+                with lock:
+                    done = done_count[0]
+                if done - reported >= 20 or done == len(needs_resolve):
+                    print(f"  {done}/{len(needs_resolve)} — "
+                          f"phone: +{filled_phone_list[0]}  desc: +{filled_desc_list[0]}")
+                    reported = done
 
+        filled_phone = filled_phone_list[0]
+        filled_desc  = filled_desc_list[0]
         browser.close()
 
     # Boilerplate dedup
@@ -1296,9 +1453,14 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
                 r["description"] = ""
         print(f"  Cleared {cleared} boilerplate descriptions")
 
-    # Write back
+    # Write back — strip private fields, only write OUTPUT_FIELDS
+    _private = {"_detail_url", "_resolve_error"}
+    for r in rows:
+        for k in _private:
+            r.pop(k, None)
+    out_fields = [f for f in fieldnames if f not in _private]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=out_fields)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1361,9 +1523,10 @@ if __name__ == "__main__":
         print("No records found. The site structure may have changed.")
         sys.exit(1)
 
-    # Generic resolution pass — runs whenever records are missing street, phone, or description
+    # Generic resolution pass — only runs when records have a _detail_url to fetch
+    # and are missing street, phone, or description
     missing_addr = [i for i, r in enumerate(records)
-                    if r.get("website") and (
+                    if r.get("_detail_url") and (
                         not r.get("street")
                         or not r.get("phone")
                         or not r.get("description")
@@ -1371,42 +1534,51 @@ if __name__ == "__main__":
     if missing_addr:
         print(f"\nResolution pass — {len(missing_addr)} records missing phone/address/description...")
 
-        # Detect if detail pages are JS-rendered by probing the first one with plain HTTP
+        # Detect if detail pages are JS-rendered by probing the first _detail_url
+        # Must use _detail_url specifically — external business websites won't be JS-rendered
         import requests as _rq2
-        _probe_url = (records[missing_addr[0]].get("_detail_url", "")
-                      or records[missing_addr[0]].get("website", ""))
+        _probe_url = ""
+        for _r in (records[i] for i in missing_addr):
+            if _r.get("_detail_url"):
+                _probe_url = _r["_detail_url"]
+                break
         _js_rendered = False
         if _probe_url:
             try:
+                from bs4 import BeautifulSoup as _BS2
                 _probe = _rq2.get(_probe_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-                _soup_probe = BeautifulSoup(_probe.text, "lxml")
-                # JS-rendered if page has almost no text after stripping boilerplate
-                _probe_text = _soup_probe.get_text(strip=True)
+                _probe_text = _BS2(_probe.text, "lxml").get_text(strip=True)
                 _js_rendered = len(_probe_text) < 500 or "browser is not supported" in _probe_text
-            except Exception:
-                pass
+                print(f"  Probed {_probe_url[:60]}... JS-rendered: {_js_rendered}")
+            except Exception as _pe:
+                print(f"  Probe failed: {_pe}")
 
         if _js_rendered:
             print(f"  Detail pages are JS-rendered — using Playwright for resolution...")
-            # Reuse the already-open Playwright context if available, else note it
-            # Write CSV to temp file and call resolve_csv_with_playwright inline
-            import tempfile, os as _os2
-            _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False,
-                                               newline="", encoding="utf-8")
-            _writer = csv.DictWriter(_tmp, fieldnames=OUTPUT_FIELDS)
-            _writer.writeheader()
-            _writer.writerows(records)
-            _tmp.close()
-            resolve_csv_with_playwright(_tmp.name)
-            with open(_tmp.name, newline="", encoding="utf-8") as _f2:
-                _resolved = list(csv.DictReader(_f2))
-            _os2.unlink(_tmp.name)
-            # Merge resolved data back into records
-            for i, r in enumerate(_resolved):
-                if i < len(records):
-                    for field in ("phone", "description", "street", "city", "state", "zip", "website"):
-                        if r.get(field) and not records[i].get(field):
-                            records[i][field] = r[field]
+            try:
+                import tempfile, os as _os2
+                _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False,
+                                                   newline="", encoding="utf-8")
+                _tmp_fields = OUTPUT_FIELDS + ["_detail_url"]
+                _writer = csv.DictWriter(_tmp, fieldnames=_tmp_fields, extrasaction="ignore")
+                _writer.writeheader()
+                _writer.writerows(records)
+                _tmp.close()
+                print(f"  Temp CSV written: {_tmp.name} ({len(records)} rows)")
+                resolve_csv_with_playwright(_tmp.name)
+                with open(_tmp.name, newline="", encoding="utf-8") as _f2:
+                    _resolved = list(csv.DictReader(_f2))
+                _os2.unlink(_tmp.name)
+                _merge_count = 0
+                for i, r in enumerate(_resolved):
+                    if i < len(records):
+                        for field in ("phone", "description", "street", "city", "state", "zip", "website"):
+                            if r.get(field) and not records[i].get(field):
+                                records[i][field] = r[field]
+                                _merge_count += 1
+                print(f"  Merged {_merge_count} field updates back into records")
+            except Exception as _e:
+                print(f"  ERROR in Playwright resolution: {_e}")
         else:
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
