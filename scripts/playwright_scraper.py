@@ -149,7 +149,21 @@ def resolve_detail_page(detail_url, source_domain=None):
             if phone:
                 result["phone"] = phone
 
-        # Address — try Location/Address heading → sibling lines first
+        # Address — try <address> tag first (semantic HTML)
+        addr_tag = soup.find("address")
+        if addr_tag:
+            addr_text = re.sub(r'\s+', ' ', addr_tag.get_text(separator=" ", strip=True))
+            # Try full "Street, City, State ZIP" parse
+            m = re.search(r'(\d+[^,]{2,60}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', addr_text)
+            if m:
+                result["street"] = m.group(1).strip()
+                result["city"]   = m.group(2).strip()
+                result["state"]  = normalize_state(m.group(3).strip())
+                result["zip"]    = m.group(4).strip()
+            elif addr_text:
+                result["street"] = clean_address(extract_address_from_text(addr_text)) or addr_text[:80]
+
+        # Address — try Location/Address heading → sibling lines
         addr_heading = soup.find(
             ["h2", "h3", "h4", "strong", "dt"],
             string=re.compile(r"^(location|address)$", re.I)
@@ -202,6 +216,9 @@ def resolve_detail_page(detail_url, source_domain=None):
             addr = extract_address_from_text(page_text)
             if addr:
                 result["street"] = addr
+
+        # Description — use the same scoring approach as the Playwright resolver
+        result["description"] = _extract_best_description(soup, result)
 
         return result
     except Exception:
@@ -849,12 +866,15 @@ def scrape_simpleview(start_url):
                 phone = card_data.get("phone", "")
                 website = card_data.get("website", "")
 
-                all_records.append({
+                rec = {
                     "name": name, "street": street,
                     "city": card_city, "state": card_state, "zip": card_zip,
                     "phone": phone, "website": website,
                     "description": "", "source_url": start_url,
-                })
+                }
+                if card_data.get("_detail_url"):
+                    rec["_detail_url"] = card_data["_detail_url"]
+                all_records.append(rec)
 
         browser.close()
 
@@ -1248,12 +1268,12 @@ def scrape_algolia(url):
     print(f"  Detecting Algolia config...")
     cfg = detect_algolia(url)
     if not cfg:
-        # Check if page uses Algolia InstantSearch widgets even without detectable config
+        # Check raw HTML for Algolia InstantSearch class signatures
         try:
             import requests as _rq
             _r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-            if "ais-InfiniteHits" in _r.text or "ais-Hits" in _r.text:
-                print("  Algolia InstantSearch widgets detected (config embedded in JS — falling through to DOM scraper)")
+            if "ais-InfiniteHits" in _r.text or "ais-Hits" in _r.text or "instantsearch" in _r.text.lower():
+                print("  Algolia InstantSearch detected (config in JS bundle — using DOM scraper)")
             else:
                 print("  No Algolia config found.")
         except Exception:
@@ -1405,7 +1425,7 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
 
     needs_resolve = [i for i, r in enumerate(rows)
                      if (r.get("_detail_url") or r.get(detail_url_field))
-                     and (not r.get("phone") or not r.get("description"))]
+                     and (not r.get("phone") or not r.get("description") or not r.get("street"))]
 
     if not needs_resolve:
         print(f"Nothing to resolve — all {len(rows)} records have phone and description.")
@@ -1417,7 +1437,7 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
     filled_phone = 0
     filled_desc  = 0
 
-    CONCURRENCY = 8  # parallel browser pages
+    CONCURRENCY = 1  # Playwright sync API is not thread-safe — use sequential
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -1425,25 +1445,19 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ))
+        pg = context.new_page()
 
-        # Create a pool of pages
-        pages = [context.new_page() for _ in range(CONCURRENCY)]
-        page_available = list(range(CONCURRENCY))  # indices of free pages
-        import threading
-        lock = threading.Lock()
-        filled_phone_list = [0]
-        filled_desc_list  = [0]
-        done_count = [0]
+        filled_phone = 0
+        filled_desc  = 0
 
-        def resolve_one(slot, i):
+        for n, i in enumerate(needs_resolve, 1):
             record = rows[i]
             detail_url = record.get("_detail_url", "") or record.get(detail_url_field, "")
             if not detail_url:
-                return
-            pg = pages[slot]
+                continue
             try:
-                pg.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
-                time.sleep(1.0)
+                pg.goto(detail_url, wait_until="domcontentloaded", timeout=15000)
+                time.sleep(0.8)
                 from bs4 import BeautifulSoup as _BS
                 soup = _BS(pg.content(), "lxml")
                 for tag in soup(["nav", "header", "footer"]):
@@ -1455,49 +1469,32 @@ def resolve_csv_with_playwright(csv_path, detail_url_field="website", source_dom
                         phone = extract_phone(tel["href"])
                         if phone:
                             record["phone"] = phone
-                            with lock:
-                                filled_phone_list[0] += 1
+                            filled_phone += 1
+
+                if not record.get("street"):
+                    addr_tag = soup.find("address")
+                    if addr_tag:
+                        addr_text = re.sub(r'\s+', ' ', addr_tag.get_text(separator=" ", strip=True))
+                        m = re.search(r'(\d+[^,]{2,60}),\s*([^,]+),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', addr_text)
+                        if m:
+                            record["street"] = m.group(1).strip()
+                            if not record.get("city"):   record["city"]  = m.group(2).strip()
+                            if not record.get("state"):  record["state"] = normalize_state(m.group(3).strip())
+                            if not record.get("zip"):    record["zip"]   = m.group(4).strip()
+                        elif addr_text:
+                            record["street"] = addr_text[:80]
 
                 if not record.get("description"):
                     desc = _extract_best_description(soup, record)
                     if desc:
                         record["description"] = desc
-                        with lock:
-                            filled_desc_list[0] += 1
+                        filled_desc += 1
             except Exception:
                 pass
-            finally:
-                with lock:
-                    done_count[0] += 1
-                    page_available.append(slot)
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        futures = []
-        slot_idx = 0
-        with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-            for i in needs_resolve:
-                # Wait for a free slot
-                while True:
-                    with lock:
-                        if page_available:
-                            slot = page_available.pop(0)
-                            break
-                    time.sleep(0.1)
-                fut = executor.submit(resolve_one, slot, i)
-                futures.append(fut)
+            if n % 20 == 0 or n == len(needs_resolve):
+                print(f"  {n}/{len(needs_resolve)} — phone: +{filled_phone}  desc: +{filled_desc}")
 
-            # Progress reporting while futures complete
-            reported = 0
-            for fut in as_completed(futures):
-                with lock:
-                    done = done_count[0]
-                if done - reported >= 20 or done == len(needs_resolve):
-                    print(f"  {done}/{len(needs_resolve)} — "
-                          f"phone: +{filled_phone_list[0]}  desc: +{filled_desc_list[0]}")
-                    reported = done
-
-        filled_phone = filled_phone_list[0]
-        filled_desc  = filled_desc_list[0]
         browser.close()
 
     # Boilerplate dedup
@@ -1641,17 +1638,15 @@ if __name__ == "__main__":
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
             def resolve_detail(record):
-                detail_url = record.get("website", "")
+                detail_url = record.get("_detail_url", "") or record.get("website", "")
                 if not detail_url:
                     return record
                 details = resolve_detail_page(detail_url)
-                for field in ("street", "city", "state", "zip", "phone"):
+                for field in ("street", "city", "state", "zip", "phone", "description"):
                     if details.get(field) and not record.get(field):
                         record[field] = details[field]
                 if not record.get("website") and details.get("website"):
                     record["website"] = details["website"]
-                if not record.get("description") and details.get("description"):
-                    record["description"] = details["description"]
                 return record
 
             with ThreadPoolExecutor(max_workers=8) as pool:
@@ -1689,7 +1684,7 @@ if __name__ == "__main__":
         "discoverdurham.com": "NC", "downtowndurham.com": "NC",
         "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
         "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
-        "discoverburkecounty.com": "NC",
+        "discoverburkecounty.com": "NC", "charlottesgotalot.com": "NC",
         # South Carolina
         "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
         "charleston.com": "SC",
@@ -1705,6 +1700,8 @@ if __name__ == "__main__":
         "austintexas.org": "TX",
         # Virginia
         "visitcharlottesville.org": "VA",
+        "visitrichmondva.com": "VA",
+        "venturerichmond.com": "VA",
     }
     source_netloc = urlparse(url).netloc.replace("www.", "")
     inferred_state = DOMAIN_STATE.get(source_netloc, "")

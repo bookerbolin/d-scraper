@@ -1023,21 +1023,28 @@ def resolve_website(record, source_domain):
             if found_website:
                 record["website"] = found_website
 
-        # Extract description if not already set
+        # Extract description using scored text blocks (language/class agnostic)
         if not record.get("description"):
-            for tag in soup.find_all(["p", "div"], class_=lambda c: c and any(
-                    x in " ".join(c).lower() for x in ["desc", "about", "summary", "bio", "content", "text"]
-                    ) if c else False):
-                txt = tag.get_text(strip=True)
-                if len(txt) > 30 and len(txt) < 500:
-                    record["description"] = txt[:300]
-                    break
-            if not record.get("description"):
-                for p in soup.find_all("p"):
-                    txt = p.get_text(strip=True)
-                    if len(txt) > 50 and len(txt) < 500:
-                        record["description"] = txt[:300]
-                        break
+            import re as _re_d
+            _NOISE = _re_d.compile(
+                r'^(mon|tue|wed|thu|fri|sat|sun|open|closed|hours|phone|fax|email|'
+                r'address|directions|map|parking|admission|\$|privacy|terms|cookie|'
+                r'follow us|share|tweet|subscribe|powered by|all rights reserved)', _re_d.I)
+            _candidates = []
+            for _tag in soup.find_all(["p", "dd", "div", "li"]):
+                if _tag.find(["p", "dd", "div"]): continue
+                _txt = _re_d.sub(r'[\xa0\s]+', ' ', _tag.get_text(separator=" ", strip=True)).strip()
+                if len(_txt) < 60 or len(_txt) > 800: continue
+                if _NOISE.match(_txt): continue
+                _s = 0
+                if _txt[0].isupper(): _s += 1
+                if _re_d.search(r'[.!?]\s', _txt) or _txt[-1] in '.!?': _s += 1
+                if 80 < len(_txt) < 500: _s += 2
+                if _s > 0:
+                    _candidates.append((_s, _txt))
+            if _candidates:
+                _candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+                record["description"] = _candidates[0][1][:400]
 
     except Exception as e:
         record["_resolve_error"] = str(e)[:120]
@@ -1104,6 +1111,36 @@ def run_scrape(url):
                 r["website"] = _builder(r["name"], url)
 
     records = resolve_all(records, urlparse(url).netloc)
+
+    # State backfill — infer from source domain if records are missing state
+    DOMAIN_STATE = {
+        "annarbor.org": "MI", "visitannarbor.org": "MI",
+        "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
+        "visitathensga.com": "GA", "exploregeorgia.org": "GA",
+        "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
+        "visitchapelhill.org": "NC", "visitraleigh.com": "NC",
+        "discoverdurham.com": "NC", "downtowndurham.com": "NC",
+        "downtownchapelhill.com": "NC", "visithillsboroughnc.com": "NC",
+        "visitwilmingtonnc.com": "NC", "homeofgolf.com": "NC",
+        "discoverburkecounty.com": "NC", "charlottesgotalot.com": "NC",
+        "visitgreenvillesc.com": "SC", "charlestoncvb.com": "SC",
+        "charleston.com": "SC",
+        "bouldercoloradousa.com": "CO",
+        "visitithaca.com": "NY",
+        "thinkiowacity.com": "IA",
+        "helloburlingtonvt.com": "VT",
+        "austintexas.org": "TX",
+        "visitcharlottesville.org": "VA",
+        "visitrichmondva.com": "VA",
+        "venturerichmond.com": "VA",
+    }
+    _source_netloc = urlparse(url).netloc.replace("www.", "")
+    _inferred_state = DOMAIN_STATE.get(_source_netloc, "")
+    if _inferred_state:
+        for r in records:
+            if not r.get("state"):
+                r["state"] = _inferred_state
+
     return records, False, ""
 
 
