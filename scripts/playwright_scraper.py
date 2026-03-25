@@ -432,6 +432,28 @@ def scrape_simpleview(start_url):
             page.evaluate("window.scrollBy(0, window.innerHeight)")
             time.sleep(1)
 
+        # Click "load more" / "show more results" buttons until exhausted
+        # Handles Algolia InfiniteHits and similar infinite-scroll patterns
+        _load_more_clicks = 0
+        while True:
+            try:
+                btn = page.query_selector(
+                    "button.ais-InfiniteHits-loadMore:not([disabled]):not(.ais-InfiniteHits-loadMore--disabled),"
+                    "button[class*='loadMore']:not([disabled]),"
+                    "button[class*='load-more']:not([disabled]),"
+                    "a[class*='load-more']"
+                )
+                if not btn or not btn.is_visible():
+                    break
+                btn.scroll_into_view_if_needed()
+                btn.click()
+                time.sleep(2)
+                _load_more_clicks += 1
+            except Exception:
+                break
+        if _load_more_clicks:
+            print(f"  Clicked 'load more' {_load_more_clicks} times")
+
         # If API responses were intercepted, use that data (cleanest)
         if api_responses:
             print(f"\nUsing {len(api_responses)} intercepted API response(s)")
@@ -612,9 +634,22 @@ def scrape_simpleview(start_url):
                         if not street and addr_text:
                             street = clean_address(extract_address_from_text(_norm_addr(addr_text))) or ""
 
+                    # Also check data-* attributes on card or its children for city/zip
+                    if not city_val:
+                        _data_src = card.find(attrs={"data-city": True}) or card
+                        if _data_src.get("data-city"):
+                            city_val = _data_src["data-city"]
+                    if not zip_val:
+                        _data_src = card.find(attrs={"data-zipcode": True}) or card
+                        if _data_src.get("data-zipcode"):
+                            zip_val = _data_src["data-zipcode"]
+
                     # Fall back to full card text
                     if not street:
-                        street, city_val, state_val, zip_val = _parse_addr(text)
+                        street, _cv, _sv, _zv = _parse_addr(text)
+                        if not city_val: city_val = _cv
+                        if not state_val: state_val = _sv
+                        if not zip_val: zip_val = _zv
                         if not street:
                             street = clean_address(extract_address_from_text(_norm_addr(text)))
 
@@ -637,6 +672,7 @@ def scrape_simpleview(start_url):
                     website_el = card.select_one(".card__website a[href], [class*='website'] a[href]")
                     if website_el:
                         website = website_el["href"]
+                    detail_url = ""
                     if not website:
                         for _a in card.find_all("a", href=True):
                             _href = _a["href"]
@@ -648,18 +684,31 @@ def scrape_simpleview(start_url):
                             if _ext:
                                 website = _href
                                 break
-                            elif _int and _href not in ("/", "#", "") and not website:
-                                website = _href
+                            elif _int and _href not in ("/", "#", "") and not detail_url:
+                                detail_url = _href if _href.startswith("http") else f"https://{parsed_netloc}{_href}"
+                                if not website:
+                                    website = detail_url
+                    else:
+                        # External website found — also capture internal detail link separately
+                        for _a in card.find_all("a", href=True):
+                            _href = _a["href"]
+                            _nl = urlparse(_href).netloc
+                            if (not _nl or _nl == parsed_netloc) and _href not in ("/", "#", ""):
+                                detail_url = _href if _href.startswith("http") else f"https://{parsed_netloc}{_href}"
+                                break
 
                     phone_el = card.select_one("a[href^='tel:']")
                     phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
 
-                    results.append({
+                    rec = {
                         "name": name, "street": street, "city": city_val,
                         "state": state_val, "zip": zip_val,
                         "card_city": card_city,
                         "website": website, "phone": phone,
-                    })
+                    }
+                    if detail_url and detail_url != website:
+                        rec["_detail_url"] = detail_url
+                    results.append(rec)
                 return results, soup
 
             # Parse first page
@@ -1199,7 +1248,16 @@ def scrape_algolia(url):
     print(f"  Detecting Algolia config...")
     cfg = detect_algolia(url)
     if not cfg:
-        print("  No Algolia config found.")
+        # Check if page uses Algolia InstantSearch widgets even without detectable config
+        try:
+            import requests as _rq
+            _r = _rq.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            if "ais-InfiniteHits" in _r.text or "ais-Hits" in _r.text:
+                print("  Algolia InstantSearch widgets detected (config embedded in JS — falling through to DOM scraper)")
+            else:
+                print("  No Algolia config found.")
+        except Exception:
+            print("  No Algolia config found.")
         return []
 
     print(f"  ✓ Algolia index: {cfg['index']}")
