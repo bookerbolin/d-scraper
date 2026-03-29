@@ -5,7 +5,11 @@ All three files import from here to avoid duplication.
 import re
 import csv
 import time
-from urllib.parse import urlparse
+import requests
+from urllib.parse import urlparse, urlencode, parse_qs, urlunparse, unquote
+from bs4 import BeautifulSoup
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
