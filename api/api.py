@@ -718,12 +718,18 @@ def parse_listings(soup, source_domain=""):
             if addr_tag:
                 parts = [s.strip() for s in addr_tag.get_text(separator="\n").split("\n") if s.strip()]
                 joined = ", ".join(parts)
-                m = re.search(r'(\d+[^,\n]{2,60}),\s*([A-Za-z][^,\n]{1,40}),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', joined)
-                if m:
-                    street    = m.group(1).strip()
-                    city_val  = m.group(2).strip()
-                    state_val = normalize_state(m.group(3).strip())
-                    zip_val   = m.group(4).strip()
+                m4 = re.search(r'(\d+[^,\n]{2,60}),\s*[^,\n]{2,40},\s*([A-Za-z][^,\n]{1,40}),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', joined)
+                m3 = re.search(r'(\d+[^,\n]{2,60}),\s*([A-Za-z][^,\n]{1,40}),\s*([A-Za-z ]{2,20})\s+(\d{5})\b', joined)
+                if m4:
+                    street    = m4.group(1).strip()
+                    city_val  = m4.group(2).strip()
+                    state_val = normalize_state(m4.group(3).strip())
+                    zip_val   = m4.group(4).strip()
+                elif m3:
+                    street    = m3.group(1).strip()
+                    city_val  = m3.group(2).strip()
+                    state_val = normalize_state(m3.group(3).strip())
+                    zip_val   = m3.group(4).strip()
 
             # Try full "Street, City, State ZIP" from card text
             if not street:
@@ -738,6 +744,15 @@ def parse_listings(soup, source_domain=""):
                     zip_val   = full_addr.group(4).strip()
                 else:
                     street = clean_address(extract_address_from_text(text))
+
+            # If city still blank, try to extract from street field
+            if street and not city_val:
+                m_csz = re.search(r'^(.*?\d+\s+\S+.*?)\s+([A-Za-z][^,]{2,30})\s*,?\s*([A-Z]{2})\s+(\d{5})\b', street)
+                if m_csz:
+                    street    = m_csz.group(1).strip()
+                    city_val  = m_csz.group(2).strip()
+                    state_val = m_csz.group(3)
+                    zip_val   = m_csz.group(4)
 
             phone_el = card.find("a", href=re.compile(r'^tel:'))
             phone = extract_phone(phone_el["href"]) if phone_el else extract_phone(text)
