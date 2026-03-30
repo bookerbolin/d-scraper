@@ -291,6 +291,119 @@ def scrape_places(queries, api_key):
     return records
 
 
+def enrich_from_csv(csv_path, api_key, location_hint=""):
+    """
+    Read an existing CSV, look up each business by name on Google Places,
+    and fill in missing street/phone/website. Writes back in place.
+    Location hint (e.g. "Chapel Hill NC") is appended to each name search
+    to improve accuracy.
+    """
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    fieldnames = list(rows[0].keys()) if rows else OUTPUT_FIELDS
+
+    # Infer location hint from existing city/state if not provided
+    if not location_hint:
+        cities  = [r.get("city","")  for r in rows if r.get("city")]
+        states  = [r.get("state","") for r in rows if r.get("state")]
+        if cities and states:
+            location_hint = f"{cities[0]} {states[0]}"
+        elif cities:
+            location_hint = cities[0]
+
+    print(f"Enriching {len(rows)} records from: {csv_path}")
+    print(f"Location hint: {location_hint!r}")
+
+    needs_enrich = [r for r in rows
+                    if not r.get("street") or not r.get("phone") or not r.get("website")
+                    or not r.get("city") or not r.get("zip")]
+    print(f"Records needing enrichment: {len(needs_enrich)}/{len(rows)}")
+
+    filled_street = filled_phone = filled_website = 0
+
+    for i, record in enumerate(rows, 1):
+        if record.get("street") and record.get("phone") and record.get("website") \
+                and record.get("city") and record.get("zip"):
+            continue
+
+        name = record.get("name", "").strip()
+        if not name:
+            continue
+
+        query = f"{name} {location_hint}".strip()
+        try:
+            results = get_all_text_results(query, api_key)
+        except Exception as e:
+            print(f"  [{i}/{len(rows)}] ✗ {name}: {e}")
+            continue
+
+        if not results:
+            print(f"  [{i}/{len(rows)}] – {name}: no results")
+            continue
+
+        # Take the first result — most relevant match
+        place = results[0]
+        place_id = place.get("place_id")
+        if not place_id:
+            continue
+
+        try:
+            details = get_place_details(place_id, api_key)
+        except Exception as e:
+            print(f"  [{i}/{len(rows)}] ✗ {name} (details): {e}")
+            continue
+
+        raw_addr = details.get("formatted_address") or place.get("formatted_address", "")
+        street, city, state, zip_code = parse_address(raw_addr)
+
+        updated = []
+        if not record.get("street") and street:
+            record["street"] = street
+            updated.append("street")
+        if street and not record.get("city") and city:
+            record["city"] = city
+            updated.append("city")
+        if street and not record.get("state") and state:
+            record["state"] = state
+        if street and not record.get("zip") and zip_code:
+            record["zip"] = zip_code
+            updated.append("zip")
+        if not record.get("street") and not record.get("city"):
+            # Full address from Google even if we had nothing
+            if street:
+                record["street"] = street
+                record["city"]   = city
+                record["state"]  = state
+                record["zip"]    = zip_code
+                filled_street += 1
+                updated.append("street")
+        elif "street" in updated:
+            filled_street += 1
+        if not record.get("phone") and details.get("formatted_phone_number"):
+            record["phone"] = details["formatted_phone_number"]
+            filled_phone += 1
+            updated.append("phone")
+        if not record.get("website") and details.get("website"):
+            record["website"] = details["website"]
+            filled_website += 1
+            updated.append("website")
+
+        status = f"+{','.join(updated)}" if updated else "no new data"
+        print(f"  [{i}/{len(rows)}] {name}: {status}")
+        time.sleep(0.05)
+
+    # Write back
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\n✅ Enriched {csv_path}")
+    print(f"   Street filled:  +{filled_street}")
+    print(f"   Phone filled:   +{filled_phone}")
+    print(f"   Website filled: +{filled_website}")
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -299,7 +412,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("query", help='Primary search query, e.g. "restaurants in Greenville SC"')
+    parser.add_argument("query", nargs="?",
+                        help='Primary search query, e.g. "restaurants in Greenville SC"')
+    parser.add_argument("--csv", metavar="FILE",
+                        help="Enrich an existing CSV — looks up each business by name and fills missing fields")
+    parser.add_argument("--location", metavar="LOCATION",
+                        help='Location hint for --csv mode, e.g. "Chapel Hill NC" (auto-detected if omitted)')
     parser.add_argument("--queries", nargs="+", metavar="QUERY",
                         help="Additional queries to run (results are merged and deduplicated)")
     parser.add_argument("--expand", action="store_true",
@@ -307,6 +425,9 @@ def main():
     parser.add_argument("--key", metavar="API_KEY",
                         help="Google Places API key (or set GOOGLE_PLACES_API_KEY env var)")
     args = parser.parse_args()
+
+    if not args.query and not args.csv:
+        parser.error("provide a search query or --csv FILE")
 
     # Resolve API key
     api_key = (
@@ -320,6 +441,12 @@ def main():
         print("Error: no API key provided.")
         sys.exit(1)
 
+    # ── CSV enrichment mode ──
+    if args.csv:
+        enrich_from_csv(args.csv, api_key, location_hint=args.location or "")
+        return
+
+    # ── Normal query mode ──
     # Build query list
     queries = [args.query]
     if args.queries:
