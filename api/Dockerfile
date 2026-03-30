@@ -2,11 +2,10 @@ FROM python:3.12
 
 WORKDIR /app
 
-COPY api/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api/api.py .
-COPY scripts/common.py .
+COPY api.py common.py .
 
 EXPOSE 8080
 
