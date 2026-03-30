@@ -100,6 +100,77 @@ class ScrapeResponse(BaseModel):
 
 
 
+def enrich_with_places(records, location_hint, api_key):
+    """
+    For each record missing street/city/zip/phone/website, look it up
+    by name on Google Places and fill in the gaps.
+    """
+    import time as _time
+
+    BASE_URL = "https://maps.googleapis.com/maps/api/place"
+
+    def _text_search(query):
+        r = requests.get(f"{BASE_URL}/textsearch/json",
+                         params={"query": query, "key": api_key}, timeout=10)
+        data = r.json()
+        return data.get("results", [])
+
+    def _place_details(place_id):
+        r = requests.get(f"{BASE_URL}/details/json",
+                         params={"place_id": place_id,
+                                 "fields": "name,formatted_address,formatted_phone_number,website",
+                                 "key": api_key}, timeout=10)
+        return r.json().get("result", {})
+
+    def _parse_addr(formatted):
+        # "123 Main St, City, ST 12345, USA"
+        import re as _re
+        m = _re.search(r'^(.+?),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})', formatted or "")
+        if m:
+            return m.group(1).strip(), m.group(2).strip(), m.group(3), m.group(4)
+        return "", "", "", ""
+
+    enriched = 0
+    for record in records:
+        needs = (not record.get("street") or not record.get("city") or
+                 not record.get("zip") or not record.get("phone") or
+                 not record.get("website"))
+        if not needs:
+            continue
+        name = record.get("name", "").strip()
+        if not name:
+            continue
+        try:
+            results = _text_search(f"{name} {location_hint}".strip())
+            if not results:
+                continue
+            place_id = results[0].get("place_id")
+            if not place_id:
+                continue
+            details = _place_details(place_id)
+            street, city, state, zip_code = _parse_addr(
+                details.get("formatted_address") or
+                results[0].get("formatted_address", ""))
+            if not record.get("street") and street:
+                record["street"] = street
+            if not record.get("city") and city:
+                record["city"] = city
+            if not record.get("state") and state:
+                record["state"] = state
+            if not record.get("zip") and zip_code:
+                record["zip"] = zip_code
+            if not record.get("phone") and details.get("formatted_phone_number"):
+                record["phone"] = details["formatted_phone_number"]
+            if not record.get("website") and details.get("website"):
+                record["website"] = details["website"]
+            enriched += 1
+        except Exception:
+            pass
+        _time.sleep(0.05)
+
+    return records, enriched
+
+
 def run_scrape(url):
     import re as _re3
 
@@ -110,9 +181,6 @@ def run_scrape(url):
         return s.strip("-")
 
     DETAIL_URL_BUILDERS = {}
-    # Detail URL builders would go here for sites where detail page URLs
-    # cannot be captured from card links and must be constructed from name.
-    # Currently empty — all known sites have capturable links.
 
     if is_simpleview(url):
         records = scrape_simpleview_api(url)
@@ -121,7 +189,6 @@ def run_scrape(url):
     if js_detected:
         return [], True, "JavaScript-rendered page — no listings found in raw HTML"
 
-    # Construct detail URLs for sites where they're derivable from name
     _source_netloc = urlparse(url).netloc.replace("www.", "")
     _builder = DETAIL_URL_BUILDERS.get(_source_netloc)
     if _builder:
@@ -131,13 +198,21 @@ def run_scrape(url):
 
     records = resolve_all(records, urlparse(url).netloc)
 
-    # State backfill — infer from source domain if records are missing state
-    _source_netloc = urlparse(url).netloc.replace("www.", "")
+    # State backfill
     _inferred_state = DOMAIN_STATE.get(_source_netloc, "")
     if _inferred_state:
         for r in records:
             if not r.get("state"):
                 r["state"] = _inferred_state
+
+    # Google Places enrichment — runs automatically when API key is configured
+    places_key = os.environ.get("GOOGLE_PLACES_API_KEY")
+    if places_key and records:
+        # Build location hint from state/city backfill or domain
+        cities  = [r.get("city","")  for r in records if r.get("city")]
+        states  = [r.get("state","") for r in records if r.get("state")]
+        loc = f"{cities[0]} {states[0]}".strip() if cities and states else _source_netloc
+        records, enriched = enrich_with_places(records, loc, places_key)
 
     return records, False, ""
 
