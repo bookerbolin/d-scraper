@@ -606,11 +606,21 @@ def parse_listings(soup, source_domain=""):
                 addr = extract_address_from_text(text)
                 if addr:
                     street = clean_address(addr)
-        records.append({
+        href = a.get("href", "")
+        # Make absolute
+        if href and not href.startswith("http"):
+            href = f"https://{source_domain}/{href.lstrip('/')}"
+        # Internal links → _detail_url; external → website
+        href_netloc = urlparse(href).netloc
+        is_internal = not href_netloc or href_netloc == source_domain
+        rec = {
             "name": name, "street": street, "city": city, "state": state,
-            "zip": zip_code, "phone": "", "website": a.get("href", ""),
+            "zip": zip_code, "phone": "", "website": "" if is_internal else href,
             "description": desc_el.get_text(strip=True) if desc_el else "",
-        })
+        }
+        if is_internal and href:
+            rec["_detail_url"] = href
+        records.append(rec)
     if records:
         return records, "hillsborough-style"
 
@@ -1329,7 +1339,7 @@ def resolve_all(records, source_domain, log=print):
     internal = [i for i, r in enumerate(records)
                 if (
                     (r.get("website") and urlparse(r["website"]).netloc in ("", source_domain))
-                    or (r.get("_detail_url") and (not r.get("phone") or not r.get("description")))
+                    or (r.get("_detail_url") and (not r.get("phone") or not r.get("description") or not r.get("street")))
                     or (r.get("website") and not r.get("street") and not r.get("phone"))
                 )]
     if not internal:
