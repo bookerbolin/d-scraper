@@ -118,9 +118,15 @@ def enrich_with_places(records, location_hint, api_key):
     def _place_details(place_id):
         r = requests.get(f"{BASE_URL}/details/json",
                          params={"place_id": place_id,
-                                 "fields": "name,formatted_address,formatted_phone_number,website",
+                                 "fields": "name,formatted_address,formatted_phone_number,website,url,types",
                                  "key": api_key}, timeout=10)
-        return r.json().get("result", {})
+        data = r.json()
+        result = data.get("result", {})
+        # Log first record's raw response for debugging
+        if not hasattr(_place_details, "_logged"):
+            _place_details._logged = True
+            print(f"[Places debug] status={data.get('status')} keys={list(result.keys())}")
+        return result
 
     def _parse_addr(formatted):
         # "123 Main St, City, ST 12345, USA"
