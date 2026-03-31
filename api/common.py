@@ -1345,13 +1345,16 @@ def resolve_all(records, source_domain, log=print):
     if not internal:
         return records
     log(f"  Resolving {len(internal)} detail pages...")
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(resolve_website, records[i], source_domain): i for i in internal}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {}
+        for i, idx in enumerate(internal):
+            time.sleep(0.3)  # stagger submissions to avoid rate limiting
+            futures[pool.submit(resolve_website, records[idx], source_domain)] = idx
         done = 0
         for future in as_completed(futures):
             idx = futures[future]
             try:
-                records[idx] = future.result(timeout=10)
+                records[idx] = future.result(timeout=15)
             except Exception:
                 pass
             done += 1
