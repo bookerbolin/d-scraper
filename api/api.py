@@ -257,6 +257,7 @@ async def scrape(
             city=r.get("city", ""),
             state=r.get("state", ""),
             zip=r.get("zip", ""),
+            phone=r.get("phone", ""),
             website=r.get("website", ""),
             description=r.get("description", ""),
             source_url=r.get("source_url", url),
