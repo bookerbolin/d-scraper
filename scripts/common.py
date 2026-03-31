@@ -702,7 +702,7 @@ def parse_listings(soup, source_domain=""):
                             lines.append(("link", href))
                         elif text.lower() == "details" or "/directory/" in href:
                             detail_url = href
-                        elif href.startswith("http") and not any(s in href for s in ["facebook", "instagram", "twitter", "yelp"]):
+                        elif href.startswith("http") and not any(s in href for s in ["facebook", "instagram", "twitter", "x.com", "yelp", "tripadvisor"]):
                             lines.append(("link", href))
                         node = node.next_sibling
                         continue
@@ -943,7 +943,7 @@ def parse_listings(soup, source_domain=""):
                         if href.startswith("tel:"):
                             phone = extract_phone(href)
                         elif href.startswith("http") and not any(
-                                s in href for s in ["facebook", "instagram", "twitter"]):
+                                s in href for s in ["facebook", "instagram", "twitter", "x.com", "yelp", "tripadvisor"]):
                             website = href
                     elif node.name == "p":
                         text = node.get_text(strip=True)
@@ -1178,7 +1178,7 @@ def resolve_website(record, source_domain):
         else:
             return record
     website = fetch_url
-    SKIP = [source_domain, "facebook.com", "instagram.com", "twitter.com",
+    SKIP = [source_domain, "facebook.com", "instagram.com", "twitter.com", "x.com",
             "yelp.com", "google.com", "tripadvisor.com",
             "linkedin.com", "tiktok.com", "youtube.com", "pinterest.com"]
     SOCIAL = ["facebook.com", "instagram.com", "twitter.com", "x.com",
