@@ -137,6 +137,9 @@ def enrich_with_places(records, location_hint, api_key):
         return "", "", "", ""
 
     enriched = 0
+    needs_count = sum(1 for r in records if not r.get("street") or not r.get("city") or
+                      not r.get("zip") or not r.get("phone") or not r.get("website"))
+    print(f"[Places debug] {len(records)} records, {needs_count} need enrichment")
     for record in records:
         needs = (not record.get("street") or not record.get("city") or
                  not record.get("zip") or not record.get("phone") or
