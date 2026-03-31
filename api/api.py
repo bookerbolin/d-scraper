@@ -140,22 +140,23 @@ def enrich_with_places(records, location_hint, api_key):
     needs_count = sum(1 for r in records if not r.get("street") or not r.get("city") or
                       not r.get("zip") or not r.get("phone") or not r.get("website"))
     print(f"[Places debug] {len(records)} records, {needs_count} need enrichment")
-    for record in records:
+
+    def _enrich_one(record):
         needs = (not record.get("street") or not record.get("city") or
                  not record.get("zip") or not record.get("phone") or
                  not record.get("website"))
         if not needs:
-            continue
+            return 0
         name = record.get("name", "").strip()
         if not name:
-            continue
+            return 0
         try:
             results = _text_search(f"{name} {location_hint}".strip())
             if not results:
-                continue
+                return 0
             place_id = results[0].get("place_id")
             if not place_id:
-                continue
+                return 0
             details = _place_details(place_id)
             street, city, state, zip_code = _parse_addr(
                 details.get("formatted_address") or
@@ -172,10 +173,14 @@ def enrich_with_places(records, location_hint, api_key):
                 record["phone"] = details["formatted_phone_number"]
             if not record.get("website") and details.get("website"):
                 record["website"] = details["website"]
-            enriched += 1
+            return 1
         except Exception:
-            pass
-        _time.sleep(0.05)
+            return 0
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+    with _TPE(max_workers=10) as pool:
+        futures = [pool.submit(_enrich_one, r) for r in records]
+        enriched = sum(f.result() for f in futures)
 
     return records, enriched
 
