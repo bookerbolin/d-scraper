@@ -70,7 +70,8 @@ async def verify_api_key(key: Optional[str] = Security(api_key_header)):
 
 class ScrapeRequest(BaseModel):
     url: str
-    timeout: int = 60  # max seconds to spend scraping (not enforced hard, just a hint)
+    location: str = ""  # optional location hint for Places enrichment, e.g. "Wolfeboro NH"
+    timeout: int = 60
 
 
 class ScrapeRecord(BaseModel):
@@ -158,9 +159,20 @@ def enrich_with_places(records, location_hint, api_key):
             if not place_id:
                 return 0
             details = _place_details(place_id)
+
+            # Sanity check — reject results from wrong state
+            import re as _vre
+            hint_state = ""
+            m = _vre.search(r'\b([A-Z]{2})\b', location_hint.upper())
+            if m:
+                hint_state = m.group(1)
+
             street, city, state, zip_code = _parse_addr(
                 details.get("formatted_address") or
                 results[0].get("formatted_address", ""))
+
+            if hint_state and state and state != hint_state:
+                return 0  # wrong state — skip
             if not record.get("street") and street:
                 record["street"] = street
             if not record.get("city") and city:
@@ -185,7 +197,7 @@ def enrich_with_places(records, location_hint, api_key):
     return records, enriched
 
 
-def run_scrape(url):
+def run_scrape(url, location_hint=""):
     import re as _re3
 
     def _name_to_slug(name):
@@ -222,11 +234,12 @@ def run_scrape(url):
     # Google Places enrichment — runs automatically when API key is configured
     places_key = os.environ.get("GOOGLE_PLACES_API_KEY")
     if places_key and records:
-        # Build location hint from state/city backfill or domain
-        cities  = [r.get("city","")  for r in records if r.get("city")]
-        states  = [r.get("state","") for r in records if r.get("state")]
-        loc = f"{cities[0]} {states[0]}".strip() if cities and states else _source_netloc
-        records, enriched = enrich_with_places(records, loc, places_key)
+        # Use provided hint, or auto-detect from records, or fall back to domain
+        if not location_hint:
+            cities = [r.get("city","") for r in records if r.get("city")]
+            states = [r.get("state","") for r in records if r.get("state")]
+            location_hint = f"{cities[0]} {states[0]}".strip() if cities and states else _source_netloc
+        records, enriched = enrich_with_places(records, location_hint, places_key)
 
     return records, False, ""
 
@@ -248,7 +261,7 @@ async def scrape(
         url = "https://" + url
 
     try:
-        records, js_detected, message = run_scrape(url)
+        records, js_detected, message = run_scrape(url, location_hint=body.location.strip())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scrape failed: {str(e)}")
 

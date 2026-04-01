@@ -311,6 +311,14 @@ def enrich_from_csv(csv_path, api_key, location_hint=""):
         elif cities:
             location_hint = cities[0]
 
+    if not location_hint:
+        print("⚠️  Warning: no location hint provided and none could be auto-detected from CSV.")
+        print("   Google may match businesses in the wrong city/state.")
+        print("   Re-run with --location \"City ST\" for accurate results.")
+        location_hint_required = input("Enter location (e.g. 'Wolfeboro NH') or press Enter to continue anyway: ").strip()
+        if location_hint_required:
+            location_hint = location_hint_required
+
     print(f"Enriching {len(rows)} records from: {csv_path}")
     print(f"Location hint: {location_hint!r}")
 
@@ -355,6 +363,17 @@ def enrich_from_csv(csv_path, api_key, location_hint=""):
 
         raw_addr = details.get("formatted_address") or place.get("formatted_address", "")
         street, city, state, zip_code = parse_address(raw_addr)
+
+        # Sanity check — if location hint has a state, reject results from wrong state
+        hint_state = ""
+        if location_hint:
+            import re as _re
+            m = _re.search(r'\b([A-Z]{2})\b', location_hint.upper())
+            if m:
+                hint_state = m.group(1)
+        if hint_state and state and state != hint_state:
+            print(f"  [{i}/{len(rows)}] ✗ {name}: Google returned {city}, {state} — expected {hint_state}, skipping")
+            continue
 
         updated = []
         if not record.get("street") and street:
