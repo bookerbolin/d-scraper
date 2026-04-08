@@ -5,6 +5,7 @@ All three files import from here to avoid duplication.
 import re
 import csv
 import time
+import random
 import requests
 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse, unquote
 from bs4 import BeautifulSoup
@@ -1077,7 +1078,126 @@ def parse_listings(soup, source_domain=""):
         cards = [c for c in cards if not any(id(p) in card_ids for p in c.parents)]
         return cards
 
+    # Pattern: WordPress listing post type — elements with class containing "type-listing"
+    # Used by visitkc.com and similar WordPress directory sites
+    # Cards are divs/articles with "type-listing" class, address in <address> tag,
+    # and link to /listings/ URL
+    listing_cards = soup.find_all(
+        lambda tag: tag.name in ("div", "article", "li")
+        and any("type-listing" in c for c in (tag.get("class") or []))
+    )
+    if listing_cards:
+        records = []
+        for card in listing_cards:
+            # Name from h2-h5 or entry-title
+            name_el = card.find(class_=re.compile(r'entry-title|card-title', re.I)) \
+                      or card.find(["h2","h3","h4","h5"])
+            name = name_el.get_text(strip=True) if name_el else ""
+            if not name:
+                continue
+            # Detail URL from stretched-link or first internal link
+            detail_url = ""
+            website = ""
+            for a in card.find_all("a", href=True):
+                href = a["href"]
+                netloc = urlparse(href).netloc
+                is_int = not netloc or netloc == source_domain
+                if is_int and "/listings/" in href and not detail_url:
+                    detail_url = href if href.startswith("http") else f"https://{source_domain}{href}"
+                elif netloc and netloc != source_domain and not website:
+                    website = href
+            # Address from <address> tag
+            street = city_val = state_val = zip_val = ""
+            addr_tag = card.find("address")
+            if addr_tag:
+                # Remove nested <a> tags (neighborhood links) — get only text nodes
+                addr_parts = []
+                for content in addr_tag.children:
+                    if hasattr(content, 'get_text'):
+                        # It's a tag — skip neighborhood links
+                        if content.name == 'a' and '/neighborhoods/' in content.get('href',''):
+                            continue
+                        addr_parts.append(content.get_text(strip=True))
+                    else:
+                        t = str(content).strip()
+                        if t:
+                            addr_parts.append(t)
+                addr_text = " ".join(p for p in addr_parts if p).strip()
+                # Try full parse
+                m = re.search(r'(\d+[^,]{2,60}),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})\b', addr_text)
+                if m:
+                    street = m.group(1).strip()
+                    city_val = m.group(2).strip()
+                    state_val = m.group(3)
+                    zip_val = m.group(4)
+                elif addr_text:
+                    street = clean_address(addr_text)
+            # Description
+            desc_el = card.find(class_=re.compile(r'desc|excerpt|summary|body', re.I))
+            description = desc_el.get_text(strip=True) if desc_el else ""
+            rec = {
+                "name": name, "street": street, "city": city_val,
+                "state": state_val, "zip": zip_val, "phone": "",
+                "website": website, "description": description,
+            }
+            if detail_url:
+                rec["_detail_url"] = detail_url
+            records.append(rec)
+        if records:
+            return records, "type-listing"
+
     inferred = _infer_cards(soup)
+    if inferred:
+        # Filter out editorial/blog cards before processing
+        # Signal 1: name looks like an article title (starts with article-like phrase)
+        EDITORIAL_NAME_RE = re.compile(
+            r'^(a guide|the best|best |top |guide to|how to|where to|what to|'
+            r'why |when |exploring|discover|introducing|everything you|'
+            r'\d+ (best|great|amazing|top|must|ways)|'
+            r'(kansas city|new york|chicago|seattle|austin|denver|nashville|'
+            r'portland|boston|atlanta|miami|phoenix|san diego|las vegas|'
+            r'new orleans|baltimore|pittsburgh|minneapolis|cleveland|'
+            r'cincinnati|columbus|indianapolis|memphis|louisville|richmond|'
+            r'charlotte|raleigh|durham|chapel hill|asheville|greensboro)'
+            r"\s+(is|has|was|'s|bbq|food|dining|bar|beer|guide|trail|scene))",
+            re.I
+        )
+        # Signal 2: internal link goes to /blog/, /articles/, /guides/, /stories/, /news/
+        EDITORIAL_URL_RE = re.compile(
+            r'/(blog|articles?|guides?|stories|news|posts?|editorial|features?)/', re.I
+        )
+        # Signal 3: listing URLs suggest real businesses
+        LISTING_URL_RE = re.compile(
+            r'/(listings?|directory|businesses?|places?|members?|vendors?)/', re.I
+        )
+
+        def is_editorial(card):
+            # Check name
+            name_el = card.find(["h2","h3","h4","h5"])
+            if name_el:
+                name = name_el.get_text(strip=True)
+                if EDITORIAL_NAME_RE.match(name):
+                    return True
+            # Check links
+            has_listing_url = False
+            has_editorial_url = False
+            for a in card.find_all("a", href=True):
+                href = a.get("href", "")
+                if LISTING_URL_RE.search(href):
+                    has_listing_url = True
+                if EDITORIAL_URL_RE.search(href):
+                    has_editorial_url = True
+            if has_editorial_url and not has_listing_url:
+                return True
+            return False
+
+        # If the page has a mix, filter to listing cards only when possible
+        listing_cards = [c for c in inferred if not is_editorial(c)]
+        editorial_cards = [c for c in inferred if is_editorial(c)]
+        if listing_cards and editorial_cards:
+            # Mixed page — use only listing cards
+            inferred = listing_cards
+        # If all cards look editorial, keep all (might be a false positive)
     if inferred:
         records = []
         for card in inferred:
