@@ -115,9 +115,16 @@ def extract_address_from_text(text):
 
 
 def clean_address(text):
+    if not text:
+        return text
+    # Strip leading digits/ID prefix before "Address" keyword: "0570 Address 106 E Main St" → "106 E Main St"
     match = re.search(r"\bAddress\s+([^\n]+)", text, re.IGNORECASE)
     if match:
         text = match.group(1).strip()
+    else:
+        # Strip bare leading digits that aren't part of a street number
+        # e.g. "1234 106 E Main St" where 1234 is an ID — detect if two number sequences at start
+        text = re.sub(r"^\d{3,6}\s+(?=\d)", "", text).strip()
     text = re.sub(
         r"\s+(features|phone|website|social info|open late|outdoor|lunch|breakfast|dinner)\b.*$",
         "", text, flags=re.IGNORECASE
