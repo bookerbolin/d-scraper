@@ -31,7 +31,7 @@ STATE_ABBR = {
 }
 
 DOMAIN_STATE = {
-    "annarbor.org": "MI", "visitannarbor.org": "MI",
+    "visithendersonvillenc.org": "NC",
     "visitmadison.com": "WI", "visitmilwaukee.org": "WI",
     "visitathensga.com": "GA", "exploregeorgia.org": "GA",
     "visitsavannah.com": "GA", "gosouthsavannah.com": "GA",
@@ -416,6 +416,22 @@ def resolve_detail_page(detail_url, source_domain=None):
 
         # Description — use the same scoring approach as the Playwright resolver
         result["description"] = _extract_best_description(soup, result)
+
+        # State inference from page title — many CVB detail pages include
+        # "Business Name - Visit City, ST" in the title
+        if not result.get("state"):
+            title = soup.find("title")
+            if title:
+                title_text = title.get_text(strip=True)
+                m_st = re.search(r',\s*([A-Z]{2})\b', title_text)
+                if m_st:
+                    result["state"] = m_st.group(1)
+                else:
+                    # Try full state name: "Hendersonville, North Carolina"
+                    for name, abbr in STATE_ABBR.items():
+                        if name in title_text.lower():
+                            result["state"] = abbr
+                            break
 
         return result
     except Exception:
@@ -1332,6 +1348,20 @@ def resolve_website(record, source_domain):
             desc = _extract_best_description(soup, record)
             if desc:
                 record["description"] = desc
+
+        # State inference from page title
+        if not record.get("state"):
+            title = soup.find("title")
+            if title:
+                title_text = title.get_text(strip=True)
+                m_st = re.search(r',\s*([A-Z]{2})\b', title_text)
+                if m_st:
+                    record["state"] = m_st.group(1)
+                else:
+                    for name, abbr in STATE_ABBR.items():
+                        if name in title_text.lower():
+                            record["state"] = abbr
+                            break
 
     except Exception as e:
         record["_resolve_error"] = str(e)[:120]
