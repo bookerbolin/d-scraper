@@ -4,21 +4,20 @@ Wraps the scraper logic and exposes it as an HTTP API.
 Deploy to Fly.io and call from your Deno backend.
 
 Endpoints:
-    GET  /health          — liveness check
-    POST /scrape          — scrape a URL, returns JSON records
+    GET  /health             — liveness check
+    POST /scrape             — start a scrape job, returns job_id immediately
+    GET  /job/{job_id}       — poll for job status/results
 """
 
 import os
 import re
-import csv
 import time
-import random
-import secrets
+import uuid
+import threading
 import requests
-from bs4 import BeautifulSoup
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Literal
 
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
@@ -34,15 +33,10 @@ from common import (
     MAX_PAGES, OUTPUT_FIELDS,
 )
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+# ── App setup ──────────────────────────────────────────────────────────────────
 
-app = FastAPI(
-    title="Scraper API",
-    description="Scrapes directory-style listing pages and returns structured JSON.",
-    version="1.0.0",
-)
+app = FastAPI(title="Scraper API", version="2.0.0")
 
-# Allow your Deno app's origin — set via env var or allow all for dev
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
@@ -51,9 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── API key auth ──────────────────────────────────────────────────────────────
-# Set API_KEY env var in Fly.io secrets: fly secrets set API_KEY=your-secret-here
-# If not set, auth is disabled (useful for local dev)
+# ── Auth ───────────────────────────────────────────────────────────────────────
 
 API_KEY = os.environ.get("API_KEY")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -61,16 +53,29 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def verify_api_key(key: Optional[str] = Security(api_key_header)):
     if API_KEY is None:
-        return  # Auth disabled — no key configured
+        return
     if key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
 
-# ── Request / response models ─────────────────────────────────────────────────
+# ── Job queue ──────────────────────────────────────────────────────────────────
+
+JOBS: dict = {}
+JOB_TTL = 600  # 10 minutes
+
+
+def _prune_jobs():
+    now = time.time()
+    expired = [jid for jid, j in list(JOBS.items()) if now - j["created_at"] > JOB_TTL]
+    for jid in expired:
+        del JOBS[jid]
+
+
+# ── Models ─────────────────────────────────────────────────────────────────────
 
 class ScrapeRequest(BaseModel):
     url: str
-    location: str = ""  # optional location hint for Places enrichment, e.g. "Wolfeboro NH"
+    location: str = ""
     timeout: int = 60
 
 
@@ -86,35 +91,31 @@ class ScrapeRecord(BaseModel):
     source_url: str = ""
 
 
-class ScrapeResponse(BaseModel):
-    success: bool
-    url: str
-    count: int
-    js_detected: bool
-    records: list[ScrapeRecord]
+class JobStarted(BaseModel):
+    job_id: str
+    status: str = "pending"
     message: str = ""
 
 
-# ── Scraper logic (same as scraper.py) ───────────────────────────────────────
+class JobStatus(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "done", "error"]
+    url: str = ""
+    count: int = 0
+    js_detected: bool = False
+    records: list[ScrapeRecord] = []
+    message: str = ""
 
 
-
-
+# ── Places enrichment ──────────────────────────────────────────────────────────
 
 def enrich_with_places(records, location_hint, api_key):
-    """
-    For each record missing street/city/zip/phone/website, look it up
-    by name on Google Places and fill in the gaps.
-    """
-    import time as _time
-
     BASE_URL = "https://maps.googleapis.com/maps/api/place"
 
     def _text_search(query):
         r = requests.get(f"{BASE_URL}/textsearch/json",
                          params={"query": query, "key": api_key}, timeout=10)
-        data = r.json()
-        return data.get("results", [])
+        return r.json().get("results", [])
 
     def _place_details(place_id):
         r = requests.get(f"{BASE_URL}/details/json",
@@ -123,21 +124,22 @@ def enrich_with_places(records, location_hint, api_key):
                                  "key": api_key}, timeout=10)
         data = r.json()
         result = data.get("result", {})
-        # Log first record's raw response for debugging
         if not hasattr(_place_details, "_logged"):
             _place_details._logged = True
             print(f"[Places debug] status={data.get('status')} keys={list(result.keys())}")
         return result
 
     def _parse_addr(formatted):
-        # "123 Main St, City, ST 12345, USA"
-        import re as _re
-        m = _re.search(r'^(.+?),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})', formatted or "")
+        m = re.search(r'^(.+?),\s*([^,]+),\s*([A-Z]{2})\s+(\d{5})', formatted or "")
         if m:
             return m.group(1).strip(), m.group(2).strip(), m.group(3), m.group(4)
         return "", "", "", ""
 
-    enriched = 0
+    hint_state = ""
+    ms = re.search(r'\b([A-Z]{2})\b', location_hint.upper())
+    if ms:
+        hint_state = ms.group(1)
+
     needs_count = sum(1 for r in records if not r.get("street") or not r.get("city") or
                       not r.get("zip") or not r.get("phone") or not r.get("website"))
     print(f"[Places debug] {len(records)} records, {needs_count} need enrichment")
@@ -159,20 +161,10 @@ def enrich_with_places(records, location_hint, api_key):
             if not place_id:
                 return 0
             details = _place_details(place_id)
-
-            # Sanity check — reject results from wrong state
-            import re as _vre
-            hint_state = ""
-            m = _vre.search(r'\b([A-Z]{2})\b', location_hint.upper())
-            if m:
-                hint_state = m.group(1)
-
             street, city, state, zip_code = _parse_addr(
-                details.get("formatted_address") or
-                results[0].get("formatted_address", ""))
-
+                details.get("formatted_address") or results[0].get("formatted_address", ""))
             if hint_state and state and state != hint_state:
-                return 0  # wrong state — skip
+                return 0
             if not record.get("street") and street:
                 record["street"] = street
             if not record.get("city") and city:
@@ -189,31 +181,25 @@ def enrich_with_places(records, location_hint, api_key):
         except Exception:
             return 0
 
-    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
-    with _TPE(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         futures = [pool.submit(_enrich_one, r) for r in records]
         enriched = sum(f.result() for f in futures)
 
     return records, enriched
 
 
+# ── Core scrape logic ──────────────────────────────────────────────────────────
+
 def run_scrape(url, location_hint=""):
-    import re as _re3
-
-    def _name_to_slug(name):
-        s = name.lower()
-        s = _re3.sub(r"[\u2018\u2019\u0027\u0060]", "", s)
-        s = _re3.sub(r"[^a-z0-9]+", "-", s)
-        return s.strip("-")
-
     DETAIL_URL_BUILDERS = {}
 
     if is_simpleview(url):
         records = scrape_simpleview_api(url)
-        return records, False, "SimpleView CMS — used direct API (may be incomplete; use Playwright locally for full results)"
+        return records, False, "SimpleView CMS — used direct API"
+
     records, js_detected = scrape_html(url)
     if js_detected:
-        return [], True, "JavaScript-rendered page — no listings found in raw HTML"
+        return [], True, "JavaScript-rendered page — use scrape-js CLI instead"
 
     _source_netloc = urlparse(url).netloc.replace("www.", "")
     _builder = DETAIL_URL_BUILDERS.get(_source_netloc)
@@ -224,76 +210,116 @@ def run_scrape(url, location_hint=""):
 
     records = resolve_all(records, urlparse(url).netloc)
 
-    # State backfill
     _inferred_state = DOMAIN_STATE.get(_source_netloc, "")
     if _inferred_state:
         for r in records:
             if not r.get("state"):
                 r["state"] = _inferred_state
 
-    # Google Places enrichment — runs automatically when API key is configured
     places_key = os.environ.get("GOOGLE_PLACES_API_KEY")
     if places_key and records:
-        # Use provided hint, or auto-detect from records, or fall back to domain
         if not location_hint:
-            cities = [r.get("city","") for r in records if r.get("city")]
-            states = [r.get("state","") for r in records if r.get("state")]
+            cities = [r.get("city", "") for r in records if r.get("city")]
+            states = [r.get("state", "") for r in records if r.get("state")]
             location_hint = f"{cities[0]} {states[0]}".strip() if cities and states else _source_netloc
-        records, enriched = enrich_with_places(records, location_hint, places_key)
+        records, _ = enrich_with_places(records, location_hint, places_key)
 
     return records, False, ""
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+def _make_clean_records(records, url):
+    return [ScrapeRecord(
+        name=r.get("name", ""),
+        street=r.get("street", ""),
+        city=r.get("city", ""),
+        state=r.get("state", ""),
+        zip=r.get("zip", ""),
+        phone=r.get("phone", ""),
+        website=r.get("website", ""),
+        description=r.get("description", ""),
+        source_url=r.get("source_url", url),
+    ) for r in records]
+
+
+def _run_job(job_id, url, location_hint):
+    """Runs in a background thread. Updates JOBS dict as it progresses."""
+    JOBS[job_id]["status"] = "running"
+    try:
+        records, js_detected, message = run_scrape(url, location_hint=location_hint)
+        clean = _make_clean_records(records, url)
+        if js_detected:
+            message = (
+                "This page renders its listings via JavaScript and cannot be scraped "
+                "through the API. Use scrape-js CLI instead."
+            )
+        JOBS[job_id].update({
+            "status": "done",
+            "records": clean,
+            "count": len(clean),
+            "js_detected": js_detected,
+            "message": message,
+        })
+    except Exception as e:
+        JOBS[job_id].update({
+            "status": "error",
+            "message": str(e),
+        })
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.post("/scrape", response_model=ScrapeResponse)
+@app.post("/scrape", response_model=JobStarted)
 async def scrape(
     body: ScrapeRequest,
     _: None = Depends(verify_api_key),
 ):
+    """Start a scrape job. Returns job_id immediately — poll /job/{job_id} for results."""
     url = body.url.strip()
     if not url.startswith("http"):
         url = "https://" + url
 
-    try:
-        records, js_detected, message = run_scrape(url, location_hint=body.location.strip())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scrape failed: {str(e)}")
+    _prune_jobs()
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "url": url,
+        "location": body.location.strip(),
+        "records": [],
+        "count": 0,
+        "js_detected": False,
+        "message": "",
+        "created_at": time.time(),
+    }
+
+    t = threading.Thread(target=_run_job, args=(job_id, url, body.location.strip()), daemon=True)
+    t.start()
+
+    return JobStarted(job_id=job_id, status="pending", message="Scrape started")
 
 
-    # Ensure all records have all fields
-    clean = []
-    for r in records:
-        clean.append(ScrapeRecord(
-            name=r.get("name", ""),
-            street=r.get("street", ""),
-            city=r.get("city", ""),
-            state=r.get("state", ""),
-            zip=r.get("zip", ""),
-            phone=r.get("phone", ""),
-            website=r.get("website", ""),
-            description=r.get("description", ""),
-            source_url=r.get("source_url", url),
-        ))
+@app.get("/job/{job_id}", response_model=JobStatus)
+async def get_job(
+    job_id: str,
+    _: None = Depends(verify_api_key),
+):
+    """Poll for job status. Status progresses: pending → running → done | error."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired")
 
-    if js_detected:
-        message = (
-            "This page renders its listings via JavaScript and cannot be scraped "
-            "through the API. Use the command-line scraper instead: "
-            "`scrape-js <url>` (requires Playwright). "
-            "The API only handles server-rendered HTML pages."
-        )
-
-    return ScrapeResponse(
-        success=not js_detected,
-        url=url,
-        count=len(clean),
-        js_detected=js_detected,
-        records=clean,
-        message=message,
+    return JobStatus(
+        job_id=job_id,
+        status=job["status"],
+        url=job.get("url", ""),
+        count=job.get("count", 0),
+        js_detected=job.get("js_detected", False),
+        records=job.get("records", []),
+        message=job.get("message", ""),
     )
