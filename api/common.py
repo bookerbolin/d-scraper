@@ -1402,6 +1402,17 @@ def resolve_website(record, source_domain):
 
         # Extract address — try semantic <address> tag first, then text scan
         if not record.get("street"):
+            # Directorist CMS — clean address in specific elements
+            for sel in ["directorist-single-info__value", "directorist-single-map__address",
+                        "directorist-single-info-address"]:
+                el = soup.find(class_=sel)
+                if el:
+                    t = el.get_text(strip=True)
+                    # Skip the label itself ("Address106 E Main St" → strip "Address" prefix)
+                    t = re.sub(r'^Address\s*', '', t, flags=re.I).strip()
+                    if t and re.search(r'\d', t):
+                        record["street"] = clean_address(t)
+                        break
             addr_tag = soup.find("address")
             if addr_tag:
                 addr_text = re.sub(r'[\xa0\s]+', ' ', addr_tag.get_text(separator=" ", strip=True))
